@@ -36,7 +36,7 @@ export class AnthropicLLM implements LLM {
         typeof systemMessage?.content === "string"
           ? systemMessage.content
           : undefined,
-      max_tokens: 4096,
+      max_tokens: 8192,
     });
 
     const firstBlock = response.content[0];
