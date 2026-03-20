@@ -19,6 +19,7 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { logRecallEvent, mapCtx } from "./recall-telemetry.js";
+import { filterCaptureMessages } from "./capture-filter.js";
 
 // ============================================================================
 // Types
@@ -1686,6 +1687,11 @@ const memoryPlugin = {
 
           if (formattedMessages.length === 0) return;
 
+          // LCM capture filter: restrict to user-role messages to prevent
+          // re-extraction of compacted summaries (Vigil Track B, Blocker 1)
+          const captureMessages = filterCaptureMessages(formattedMessages);
+          if (captureMessages.length === 0) return;
+
           // B5+B7 FIX: Use ctx.agentId, fall back to module-level currentAgentId
           const agentId = (ctx as any)?.agentId ?? currentAgentId;
           // H2 FIX: Snapshot sessionId from ctx (turn-scoped) to avoid racy module-level read
@@ -1706,7 +1712,7 @@ const memoryPlugin = {
           };
           const addOpts = buildAddOptions(capturePool, safeSessionId, provenance);
           const result = await provider.add(
-            formattedMessages,
+            captureMessages,
             addOpts,
           );
 
