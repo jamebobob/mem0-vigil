@@ -705,6 +705,20 @@ const memoryPlugin = {
       return { agentId, channel, conversationType, chatId };
     }
 
+    function getCapturePool(agentId: string | undefined): string | undefined {
+      // Fail-closed: deny capture if agent unknown and multi-pool active
+      if (!agentId && cfg.agentMemory) return undefined;
+      const key = agentId ?? "main";
+      return cfg.agentMemory?.[key]?.capture ?? cfg.userId;
+    }
+
+    function getRecallPools(agentId: string | undefined): string[] {
+      // Fail-closed: deny all recall if agent unknown and multi-pool active
+      if (!agentId && cfg.agentMemory) return [];
+      const key = agentId ?? "main";
+      return cfg.agentMemory?.[key]?.recall ?? [cfg.userId];
+    }
+
     // Temporary compatibility stubs — removed when tools are rewired for multi-pool
     const _effectiveUserId = (_sessionKey?: string) => cfg.userId;
     const _agentUserId = (id: string) => `${cfg.userId}:agent:${id}`;
