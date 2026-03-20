@@ -70,7 +70,7 @@ named pool routing via `agentMemory` config.
 |------|---------|-------|
 | `index.ts` | Main plugin — multi-pool routing, 5 tools, 3 hooks, CLI | ~1740 |
 | `recall-telemetry.ts` | JSONL telemetry + gap journal (A1a+A1b) | ~120 |
-| `capture-filter.ts` | User-role-only message filter for LCM (B1) | ~18 |
+| `capture-filter.ts` | User-role + LCM summary detection filter for LCM (B1) | ~53 |
 | `recall-guard.ts` | Privacy boundary filter by context (A2) | ~100 |
 | `memory-views.default.json` | Default recall guard config | 10 |
 
@@ -81,9 +81,9 @@ named pool routing via `agentMemory` config.
 | `index.test.ts` | 8 (config schema + allowed keys) |
 | `sqlite-resilience.test.ts` | 11 (pre-existing) |
 | `recall-telemetry.test.ts` | 13 (JSONL, gap detection, gap journal) |
-| `capture-filter.test.ts` | 5 (role filtering, empty input, order) |
+| `capture-filter.test.ts` | 10 (role filtering, LCM summary detection, edge cases) |
 | `recall-guard.test.ts` | 11 (dm/group/cron contexts, edge cases) |
-| **Total** | **48 TypeScript tests passing** |
+| **Total** | **53 TypeScript tests passing** |
 
 ### Documentation (`openclaw/`)
 
@@ -115,7 +115,7 @@ named pool routing via `agentMemory` config.
 ## Build Status
 
 - TypeScript build: ESM + DTS clean (tsup)
-- 48 TypeScript tests passing (vitest)
+- 53 TypeScript tests passing (vitest)
 - 9 Python tests passing (unittest)
 - All code pushed to GitHub
 

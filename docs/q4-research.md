@@ -238,9 +238,12 @@ specificity that makes these sections effective may be lost.
 
 3. **postCompactionSections workaround**: After LCM compaction,
    manually enqueue the sections as a system event via a custom hook.
-   The `after_compaction` hook fires (line 109066 after overflow
-   compact, line 105882 after streaming compact). A hook could call
-   `readPostCompactionContext` and inject the result.
+   The `after_compaction` hook fires after overflow compaction (line
+   103066). Note: the streaming compaction path (line 105882) does NOT
+   fire when LCM is active because Pi's built-in compaction is
+   disabled. Only the overflow recovery path triggers `after_compaction`
+   with LCM. A hook on that path could call `readPostCompactionContext`
+   and inject the result.
 
 4. **Accept summary compression**: Trust that LCM summaries preserve
    the intent of the sections even if not the literal text. Monitor

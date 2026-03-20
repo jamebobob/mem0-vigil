@@ -88,33 +88,34 @@ These are available but not needed for initial deployment:
 
 ## Q4: postCompactionSections Support
 
-**Answer: NEEDS TESTING**
+**Answer: NO — bypassed when LCM owns compaction** (resolved by deep
+source trace in `docs/q4-research.md`)
 
-`postCompactionSections` is a **core OpenClaw feature** (`agents.defaults.compaction.postCompactionSections`),
-not a plugin feature. The string `postCompactionSections` appears **nowhere** in the
-lossless-claw source code.
+`postCompactionSections` is a core OpenClaw feature that re-injects
+AGENTS.md sections after built-in compaction. When LCM sets
+`ownsCompaction: true`, Pi's built-in compaction is disabled, the
+compaction stream events never fire, and `readPostCompactionContext`
+is never called. See `docs/q4-research.md` for the full 5-hop code
+trace with file paths and line numbers.
 
-When lossless-claw is active, it owns the `compact()` and `assemble()` lifecycle hooks.
-The OpenClaw core's built-in compaction path (which injects postCompactionSections) is
-bypassed entirely. Whether the core still injects postCompactionSections alongside the
-plugin's `assemble()` output is unclear from the source.
+**Sections likely survive through a different path**: the system prompt
+is rebuilt every turn by the core, and LCM does not replace it. But
+AGENTS.md sections are loaded as bootstrap context messages (not system
+prompt), so they get summarized rather than literally preserved.
 
-The plugin's `assemble()` returns `{ messages, estimatedTokens, systemPromptAddition }`.
-The `systemPromptAddition` field is used for LCM-specific guidance (recall instructions).
-The core may add postCompactionSections to the system prompt independently of the
-context engine's output — but this requires testing.
+**Recommended mitigation**: Move Safety and Memory Rules into
+sticky-context slots. Sticky-context injects at prompt build time,
+immune to any compaction. This is the structural fix.
 
-**Test procedure for Day 2 morning:**
+**Test procedure for Day 2 morning** (still required to verify
+behavior on gateway):
 
 1. Enable lossless-claw on main agent only
 2. Chat until compaction triggers (send enough messages to exceed `contextThreshold`)
-3. After compaction, check if the assistant still has Safety and Memory Rules sections
-4. If sections are missing: **dealbreaker** — disable LCM immediately
-5. If sections survive: Q4 = YES, proceed with LCM
-
-**Fallback if Q4 fails:** The sections could potentially be injected via sticky-context
-slots instead of postCompactionSections. Sticky-context injects at prompt build time
-(not in the transcript), so it should survive any context engine.
+3. After compaction, ask the assistant about her Safety rules and Memory Rules
+4. If she answers with specific rules: sections survived (as summary or bootstrap context)
+5. If she answers vaguely: sections were over-compressed, deploy sticky-context mitigation
+6. Regardless: verify sticky-context slots survive compaction (expected YES)
 
 ---
 
@@ -150,25 +151,18 @@ Key attributes:
 
 **CRITICAL FINDING**: Summaries are injected as `role: "user"` messages.
 
-Our current capture filter (`capture-filter.ts`) passes user-role messages through.
-However, this is **not a problem** because:
+Summaries should only exist in `assemble()` output, not in
+`event.messages` (the conversation transcript). However, as defense-
+in-depth, the capture filter (`capture-filter.ts`) has been hardened
+with a secondary check: it detects and drops messages whose content
+starts with `<summary ` (the LCM XML tag format). This catches any
+leakage without affecting normal user messages.
 
-1. The capture filter runs in the `agent_end` hook, which receives `event.messages` —
-   the **actual conversation transcript** (user input + assistant response + tool calls).
-2. LCM summaries are injected by the context engine's `assemble()` hook during prompt
-   construction, NOT as messages in the transcript.
-3. The transcript never contains the assembled context's summaries — they exist only
-   in the model's input, not in `event.messages`.
+The filter uses `/^\s*<summary\s/` which handles leading whitespace
+and multi-part array content.
 
-**Verification needed on gateway**: After enabling LCM and triggering compaction, check
-`event.messages` in the agent_end hook (add temporary debug logging) to confirm summaries
-do NOT appear. If they do appear, upgrade the capture filter to detect and strip
-`<summary>` XML content from user messages.
-
-If precise filtering is needed later, the detection is trivial:
-```typescript
-const isSummary = content.trimStart().startsWith("<summary ");
-```
+**Verification on gateway**: After enabling LCM, check gateway logs for
+unexpected capture spikes (see "What Failure Looks Like" section).
 
 ---
 
