@@ -51,4 +51,57 @@ describe("filterCaptureMessages", () => {
     const filtered = filterCaptureMessages(messages);
     expect(filtered.map((m) => m.content)).toEqual(["2", "4", "5"]);
   });
+
+  // -----------------------------------------------------------------------
+  // LCM summary detection
+  // -----------------------------------------------------------------------
+
+  it("drops role:user messages that are LCM summaries", () => {
+    const messages = [
+      { role: "user", content: '<summary id="sum_abc123" kind="leaf" depth="0" descendant_count="3">\n  <content>\nUser discussed project plans\n  </content>\n</summary>' },
+      { role: "user", content: "what should we do next?" },
+    ];
+    const filtered = filterCaptureMessages(messages);
+    expect(filtered).toEqual([
+      { role: "user", content: "what should we do next?" },
+    ]);
+  });
+
+  it("drops LCM summaries with leading whitespace", () => {
+    const messages = [
+      { role: "user", content: '  \n<summary id="sum_def" kind="condensed" depth="1">\n  <content>...</content>\n</summary>' },
+    ];
+    expect(filterCaptureMessages(messages)).toEqual([]);
+  });
+
+  it("does NOT filter normal user messages that mention 'summary'", () => {
+    const messages = [
+      { role: "user", content: "Can you give me a summary of what we discussed?" },
+      { role: "user", content: "The summary report is on my desk" },
+      { role: "user", content: "Here is a <summary> tag in my text" },
+    ];
+    const filtered = filterCaptureMessages(messages);
+    expect(filtered).toHaveLength(3);
+  });
+
+  it("drops LCM summaries in multi-part array content", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: '<summary id="sum_xyz" kind="leaf" depth="0">\n<content>...</content>\n</summary>' }] as any },
+      { role: "user", content: "normal message" },
+    ];
+    const filtered = filterCaptureMessages(messages);
+    expect(filtered).toEqual([
+      { role: "user", content: "normal message" },
+    ]);
+  });
+
+  it("keeps messages with non-string non-array content", () => {
+    const messages = [
+      { role: "user", content: null as any },
+      { role: "user", content: "real message" },
+    ];
+    const filtered = filterCaptureMessages(messages);
+    // null content isn't a summary, passes the summary check but is still role:user
+    expect(filtered).toHaveLength(2);
+  });
 });
