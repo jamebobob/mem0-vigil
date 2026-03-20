@@ -689,14 +689,36 @@ export class Memory {
     existingEmbeddings: Record<string, number[]>,
     metadata: Record<string, any>,
   ): Promise<string> {
-    const memoryId = uuidv4();
+    const dataHash = createHash("md5").update(data).digest("hex");
+
+    // Hash dedup: skip if an identical fact (by MD5) already exists in the same pool
+    const vs = this.vectorStore as any;
+    if (vs.client && vs.collectionName) {
+      try {
+        const hashFilter: any[] = [{ key: "hash", match: { value: dataHash } }];
+        if (metadata.userId) hashFilter.push({ key: "userId", match: { value: metadata.userId } });
+        const existing = await vs.client.scroll(vs.collectionName, {
+          filter: { must: hashFilter },
+          limit: 1,
+          with_payload: false,
+        });
+        if (existing.points && existing.points.length > 0) {
+          console.log(`[mem0] Exact dupe skipped (hash: ${dataHash}, pool: ${metadata.userId || "none"}): "${data.substring(0, 80)}"`);
+          return String(existing.points[0].id);
+        }
+      } catch (e: any) {
+        console.error("[mem0] Hash dedup check failed, proceeding with insert:", e.message);
+      }
+    }
+
     const embedding =
       existingEmbeddings[data] || (await this.embedder.embed(data));
 
+    const memoryId = uuidv4();
     const memoryMetadata = {
       ...metadata,
       data,
-      hash: createHash("md5").update(data).digest("hex"),
+      hash: dataHash,
       createdAt: new Date().toISOString(),
     };
 
