@@ -1593,12 +1593,19 @@ const memoryPlugin = {
           // Recall guard: filter by session context (privacy boundaries)
           const sessionInfo = extractSessionInfo(sessionId);
           const ctxType = mapCtx(sessionInfo.conversationType);
-          const guardResult = applyRecallGuard({
-            results: allResults,
-            ctx: ctxType,
-            config: memoryViewsConfig,
-          });
-          allResults = guardResult.results;
+          let filteredByGuard = 0;
+          try {
+            const guardResult = applyRecallGuard({
+              results: allResults,
+              ctx: ctxType,
+              config: memoryViewsConfig,
+            });
+            allResults = guardResult.results;
+            filteredByGuard = guardResult.removedCount;
+          } catch (guardErr) {
+            // Guard failure → fail-open, keep all results, log warning
+            api.logger.warn(`openclaw-mem0: recall guard failed, passing all results: ${String(guardErr)}`);
+          }
 
           // Recall telemetry (fires on every recall, including gaps)
           logRecallEvent({
@@ -1608,7 +1615,7 @@ const memoryPlugin = {
             results: allResults,
             pools,
             recallType: "auto",
-            filteredByGuard: guardResult.removedCount,
+            filteredByGuard,
             threshold: cfg.searchThreshold,
             resolvePath: (p) => api.resolvePath(p),
           });
