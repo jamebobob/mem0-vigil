@@ -18,6 +18,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { logRecallEvent, mapCtx } from "./recall-telemetry.js";
 
 // ============================================================================
 // Types
@@ -895,6 +896,20 @@ const memoryPlugin = {
             results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
             results = results.slice(0, limit ?? cfg.topK);
 
+            // Recall telemetry (explicit search)
+            const searchSessionInfo = extractSessionInfo(currentSessionId);
+            const searchPools = userId ? [userId] : getRecallPools(agentId);
+            logRecallEvent({
+              agent: agentId ?? "main",
+              ctx: mapCtx(searchSessionInfo.conversationType),
+              query,
+              results,
+              pools: searchPools,
+              recallType: "explicit",
+              threshold: cfg.searchThreshold,
+              resolvePath: (p) => api.resolvePath(p),
+            });
+
             if (!results || results.length === 0) {
               return {
                 content: [
@@ -1566,6 +1581,19 @@ const memoryPlugin = {
           // Sort by relevance, cap at topK total (not per pool)
           allResults.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
           allResults = allResults.slice(0, cfg.topK);
+
+          // Recall telemetry (fires on every recall, including gaps)
+          const sessionInfo = extractSessionInfo(sessionId);
+          logRecallEvent({
+            agent: agentId ?? "main",
+            ctx: mapCtx(sessionInfo.conversationType),
+            query: event.prompt,
+            results: allResults,
+            pools,
+            recallType: "auto",
+            threshold: cfg.searchThreshold,
+            resolvePath: (p) => api.resolvePath(p),
+          });
 
           if (allResults.length === 0) return;
 
