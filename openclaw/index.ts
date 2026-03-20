@@ -49,6 +49,7 @@ type Mem0Config = {
   autoRecall: boolean;
   searchThreshold: number;
   topK: number;
+  agentMemory?: Record<string, { capture: string; recall: string[] }>;
 };
 
 // Unified types for the provider interface
@@ -60,6 +61,7 @@ interface AddOptions {
   enable_graph?: boolean;
   output_format?: string;
   source?: string;
+  metadata?: Record<string, unknown>;
 }
 
 interface SearchOptions {
@@ -288,6 +290,7 @@ class OSSProvider implements Mem0Provider {
     const addOpts: Record<string, unknown> = { userId: options.user_id };
     if (options.run_id) addOpts.runId = options.run_id;
     if (options.source) addOpts.source = options.source;
+    if (options.metadata) addOpts.metadata = options.metadata;
     const result = await this.memory.add(messages, addOpts);
     return normalizeAddResult(result);
   }
@@ -537,6 +540,7 @@ const ALLOWED_KEYS = [
   "searchThreshold",
   "topK",
   "oss",
+  "agentMemory",
 ];
 
 function assertAllowedKeys(
@@ -607,6 +611,19 @@ export const mem0ConfigSchema = {
         typeof cfg.searchThreshold === "number" ? cfg.searchThreshold : 0.5,
       topK: typeof cfg.topK === "number" ? cfg.topK : 5,
       oss: ossConfig,
+      agentMemory: (() => {
+        if (!cfg.agentMemory || typeof cfg.agentMemory !== "object" || Array.isArray(cfg.agentMemory)) return undefined;
+        const am: Record<string, { capture: string; recall: string[] }> = {};
+        for (const [key, val] of Object.entries(cfg.agentMemory as Record<string, unknown>)) {
+          if (!val || typeof val !== "object" || Array.isArray(val)) continue;
+          const v = val as Record<string, unknown>;
+          am[key] = {
+            capture: typeof v.capture === "string" ? v.capture : (typeof cfg.userId === "string" ? cfg.userId : "default"),
+            recall: Array.isArray(v.recall) ? v.recall.filter((r: unknown): r is string => typeof r === "string") : [typeof cfg.userId === "string" ? cfg.userId : "default"],
+          };
+        }
+        return Object.keys(am).length > 0 ? am : undefined;
+      })(),
     };
   },
 };
@@ -639,49 +656,6 @@ function categoriesToArray(
   return Object.entries(cats).map(([key, value]) => ({ [key]: value }));
 }
 
-// ============================================================================
-// Per-agent isolation helpers (exported for testability)
-// ============================================================================
-
-/**
- * Parse an agent ID from a session key following the pattern `agent:<agentId>:<uuid>`.
- * Returns undefined for non-agent sessions, the "main" sentinel, or malformed keys.
- */
-export function extractAgentId(sessionKey: string | undefined): string | undefined {
-  if (!sessionKey) return undefined;
-  const match = sessionKey.match(/^agent:([^:]+):/);
-  const agentId = match?.[1];
-  // "main" is the primary session — fall back to configured userId
-  if (!agentId || agentId === "main") return undefined;
-  return agentId;
-}
-
-/**
- * Derive the effective user_id from a session key, namespacing per-agent.
- * Falls back to baseUserId when the session is not agent-scoped.
- */
-export function effectiveUserId(baseUserId: string, sessionKey?: string): string {
-  const agentId = extractAgentId(sessionKey);
-  return agentId ? `${baseUserId}:agent:${agentId}` : baseUserId;
-}
-
-/** Build a user_id for an explicit agentId (e.g. from tool params). */
-export function agentUserId(baseUserId: string, agentId: string): string {
-  return `${baseUserId}:agent:${agentId}`;
-}
-
-/**
- * Resolve user_id with priority: explicit agentId > explicit userId > session-derived > configured.
- */
-export function resolveUserId(
-  baseUserId: string,
-  opts: { agentId?: string; userId?: string },
-  currentSessionId?: string,
-): string {
-  if (opts.agentId) return agentUserId(baseUserId, opts.agentId);
-  if (opts.userId) return opts.userId;
-  return effectiveUserId(baseUserId, currentSessionId);
-}
 
 // ============================================================================
 // Plugin Definition
@@ -701,27 +675,53 @@ const memoryPlugin = {
 
     // Track current session ID for tool-level session scoping
     let currentSessionId: string | undefined;
-
-    // ========================================================================
-    // Per-agent isolation helpers (thin wrappers around exported functions)
-    // ========================================================================
-    const _effectiveUserId = (sessionKey?: string) =>
-      effectiveUserId(cfg.userId, sessionKey);
-    const _agentUserId = (id: string) => agentUserId(cfg.userId, id);
-    const _resolveUserId = (opts: { agentId?: string; userId?: string }) =>
-      resolveUserId(cfg.userId, opts, currentSessionId);
+    let currentAgentId: string | undefined;
 
     api.logger.info(
       `openclaw-mem0: registered (mode: ${cfg.mode}, user: ${cfg.userId}, graph: ${cfg.enableGraph}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
     );
 
+    // ========================================================================
+    // Multi-pool helpers
+    // ========================================================================
+
+    function extractSessionInfo(sessionKey: string | undefined): {
+      agentId?: string;
+      channel?: string;
+      conversationType?: string;
+      chatId?: string;
+    } {
+      if (!sessionKey) return {};
+      const parts = sessionKey.split(":");
+      // Pattern: agent:<agentId>:<channel>:<type>:<id>
+      const agentId = parts.length >= 2 && parts[0] === "agent" ? parts[1] : undefined;
+      const channel = parts.length >= 3 ? parts[2] : undefined;
+      if (channel === "cron") {
+        // Cron sessions: 4th segment is the job UUID, not a conversation type
+        return { agentId, channel, conversationType: "cron", chatId: parts.length >= 4 ? parts.slice(3).join(":") : undefined };
+      }
+      const conversationType = parts.length >= 4 ? parts[3] : undefined;
+      const chatId = parts.length >= 5 ? parts.slice(4).join(":") : undefined;
+      return { agentId, channel, conversationType, chatId };
+    }
+
+    // Temporary compatibility stubs — removed when tools are rewired for multi-pool
+    const _effectiveUserId = (_sessionKey?: string) => cfg.userId;
+    const _agentUserId = (id: string) => `${cfg.userId}:agent:${id}`;
+    const _resolveUserId = (opts: { agentId?: string; userId?: string }) => {
+      if (opts.agentId) return `${cfg.userId}:agent:${opts.agentId}`;
+      if (opts.userId) return opts.userId;
+      return cfg.userId;
+    };
+
     // Helper: build add options
-    function buildAddOptions(userIdOverride?: string, runId?: string, sessionKey?: string): AddOptions {
+    function buildAddOptions(userIdOverride?: string, runId?: string, metadata?: Record<string, unknown>): AddOptions {
       const opts: AddOptions = {
-        user_id: userIdOverride || _effectiveUserId(sessionKey),
+        user_id: userIdOverride || cfg.userId,
         source: "OPENCLAW",
       };
       if (runId) opts.run_id = runId;
+      if (metadata) opts.metadata = metadata;
       if (cfg.mode === "platform") {
         opts.custom_instructions = cfg.customInstructions;
         opts.custom_categories = categoriesToArray(cfg.customCategories);
@@ -736,10 +736,9 @@ const memoryPlugin = {
       userIdOverride?: string,
       limit?: number,
       runId?: string,
-      sessionKey?: string,
     ): SearchOptions {
       const opts: SearchOptions = {
-        user_id: userIdOverride || _effectiveUserId(sessionKey),
+        user_id: userIdOverride || cfg.userId,
         top_k: limit ?? cfg.topK,
         limit: limit ?? cfg.topK,
         threshold: cfg.searchThreshold,
@@ -931,7 +930,7 @@ const memoryPlugin = {
             const runId = !longTerm && currentSessionId ? currentSessionId : undefined;
             const result = await provider.add(
               [{ role: "user", content: text }],
-              buildAddOptions(uid, runId, currentSessionId),
+              buildAddOptions(uid, runId),
             );
 
             const added =
@@ -1374,7 +1373,7 @@ const memoryPlugin = {
           // Search long-term memories (user-scoped, isolated per agent)
           const longTermResults = await provider.search(
             event.prompt,
-            buildSearchOptions(undefined, undefined, undefined, sessionId),
+            buildSearchOptions(),
           );
 
           // Search session memories (session-scoped) if we have a session ID
@@ -1382,7 +1381,7 @@ const memoryPlugin = {
           if (currentSessionId) {
             sessionResults = await provider.search(
               event.prompt,
-              buildSearchOptions(undefined, undefined, currentSessionId, sessionId),
+              buildSearchOptions(undefined, undefined, currentSessionId),
             );
           }
 
@@ -1487,7 +1486,7 @@ const memoryPlugin = {
 
           if (formattedMessages.length === 0) return;
 
-          const addOpts = buildAddOptions(undefined, currentSessionId, sessionId);
+          const addOpts = buildAddOptions(undefined, currentSessionId);
           const result = await provider.add(
             formattedMessages,
             addOpts,
