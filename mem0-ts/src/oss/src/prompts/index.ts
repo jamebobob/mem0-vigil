@@ -282,5 +282,14 @@ export function removeCodeBlocks(text: string): string {
   // The old regex /```[^`]*```/g replaced the entire block (including
   // its content) with an empty string, so when an LLM returned JSON
   // wrapped in ```json ... ``` the actual payload was discarded.
-  return text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, "$1").trim();
+  let cleaned = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, "$1").trim();
+  try {
+    JSON.parse(cleaned);
+    return cleaned;
+  } catch (e) {
+    // If the cleaned text isn't valid JSON, try to extract the first
+    // JSON object — handles cases where the LLM wraps JSON in prose.
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    return match ? match[0] : cleaned;
+  }
 }
