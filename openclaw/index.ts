@@ -719,6 +719,14 @@ const memoryPlugin = {
       return cfg.agentMemory?.[key]?.recall ?? [cfg.userId];
     }
 
+    function isPoolAllowed(pool: string, agentId: string | undefined): boolean {
+      if (!cfg.agentMemory) return true; // no multi-pool config, allow all
+      // Deny if agent identity unknown
+      if (!agentId) return false;
+      const allowed = getRecallPools(agentId);
+      return allowed.includes(pool);
+    }
+
     // Temporary compatibility stubs — removed when tools are rewired for multi-pool
     const _effectiveUserId = (_sessionKey?: string) => cfg.userId;
     const _agentUserId = (id: string) => `${cfg.userId}:agent:${id}`;
