@@ -714,6 +714,27 @@ export class Memory {
     const embedding =
       existingEmbeddings[data] || (await this.embedder.embed(data));
 
+    // Cosine dedup: skip if a near-identical fact (cosine >= 0.98) exists in the same pool
+    if (vs.client && vs.collectionName) {
+      try {
+        const cosineFilter: any[] = [];
+        if (metadata.userId) cosineFilter.push({ key: "userId", match: { value: metadata.userId } });
+        const nearMatches = await vs.client.search(vs.collectionName, {
+          vector: embedding,
+          filter: cosineFilter.length > 0 ? { must: cosineFilter } : undefined,
+          limit: 1,
+          score_threshold: 0.98,
+          with_payload: true,
+        });
+        if (nearMatches.length > 0 && nearMatches[0].payload?.data) {
+          console.log(`[mem0] Near-dupe skipped (cosine: ${nearMatches[0].score.toFixed(3)}, pool: ${metadata.userId || "none"}): "${data.substring(0, 60)}" ~ "${nearMatches[0].payload.data.substring(0, 60)}"`);
+          return String(nearMatches[0].id);
+        }
+      } catch (e: any) {
+        console.error("[mem0] Cosine dedup check failed, proceeding with insert:", e.message);
+      }
+    }
+
     const memoryId = uuidv4();
     const memoryMetadata = {
       ...metadata,
