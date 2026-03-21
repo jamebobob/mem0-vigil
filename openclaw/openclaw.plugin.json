@@ -161,6 +161,23 @@
             "type": "string"
           }
         }
+      },
+      "agentMemory": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "capture": {
+              "type": "string"
+            },
+            "recall": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
       }
     },
     "required": []
