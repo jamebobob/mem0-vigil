@@ -621,10 +621,16 @@ export const mem0ConfigSchema = {
         for (const [key, val] of Object.entries(cfg.agentMemory as Record<string, unknown>)) {
           if (!val || typeof val !== "object" || Array.isArray(val)) continue;
           const v = val as Record<string, unknown>;
-          am[key] = {
-            capture: typeof v.capture === "string" ? v.capture : (typeof cfg.userId === "string" ? cfg.userId : "default"),
-            recall: Array.isArray(v.recall) ? v.recall.filter((r: unknown): r is string => typeof r === "string") : [typeof cfg.userId === "string" ? cfg.userId : "default"],
-          };
+          if (typeof v.capture !== "string" || !Array.isArray(v.recall)) {
+            console.warn(`openclaw-mem0: agentMemory[${key}] has invalid capture/recall — SKIPPING (fail-closed). capture must be string, recall must be array.`);
+            continue;
+          }
+          const recall = v.recall.filter((r: unknown): r is string => typeof r === "string");
+          if (recall.length === 0) {
+            console.warn(`openclaw-mem0: agentMemory[${key}].recall is empty after filtering — SKIPPING (fail-closed).`);
+            continue;
+          }
+          am[key] = { capture: v.capture, recall };
         }
         return Object.keys(am).length > 0 ? am : undefined;
       })(),
@@ -718,6 +724,8 @@ const memoryPlugin = {
       // Fail-closed: deny capture if agent unknown and multi-pool active
       if (!agentId && cfg.agentMemory) return undefined;
       const key = agentId ?? "main";
+      // Fail-closed: deny capture if agent defined but not in pool map
+      if (cfg.agentMemory && !cfg.agentMemory[key]) return undefined;
       return cfg.agentMemory?.[key]?.capture ?? cfg.userId;
     }
 
@@ -725,6 +733,8 @@ const memoryPlugin = {
       // Fail-closed: deny all recall if agent unknown and multi-pool active
       if (!agentId && cfg.agentMemory) return [];
       const key = agentId ?? "main";
+      // Fail-closed: deny recall if agent defined but not in pool map
+      if (cfg.agentMemory && !cfg.agentMemory[key]) return [];
       return cfg.agentMemory?.[key]?.recall ?? [cfg.userId];
     }
 
@@ -1027,7 +1037,7 @@ const memoryPlugin = {
             }
             const runId = !longTerm && currentSessionId ? currentSessionId : undefined;
             const provenance: Record<string, unknown> = {
-              is_private: capturePool !== "family" && sessionInfo.conversationType !== "group",
+              is_private: sessionInfo.conversationType !== "group",
               source_channel: sessionInfo.channel ?? "unknown",
               conversation_type: sessionInfo.conversationType ?? "unknown",
               chat_id: sessionInfo.chatId,
@@ -1728,7 +1738,7 @@ const memoryPlugin = {
           }
           const sessionInfo = extractSessionInfo(safeSessionId);
           const provenance: Record<string, unknown> = {
-            is_private: capturePool !== "family" && sessionInfo.conversationType !== "group",
+            is_private: sessionInfo.conversationType !== "group",
             source_channel: sessionInfo.channel ?? "unknown",
             conversation_type: sessionInfo.conversationType ?? "unknown",
             chat_id: sessionInfo.chatId,
