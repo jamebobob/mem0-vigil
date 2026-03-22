@@ -1027,7 +1027,7 @@ const memoryPlugin = {
             }
             const runId = !longTerm && currentSessionId ? currentSessionId : undefined;
             const provenance: Record<string, unknown> = {
-              is_private: sessionInfo.conversationType !== "group",
+              is_private: capturePool !== "family" && sessionInfo.conversationType !== "group",
               source_channel: sessionInfo.channel ?? "unknown",
               conversation_type: sessionInfo.conversationType ?? "unknown",
               chat_id: sessionInfo.chatId,
@@ -1728,7 +1728,7 @@ const memoryPlugin = {
           }
           const sessionInfo = extractSessionInfo(safeSessionId);
           const provenance: Record<string, unknown> = {
-            is_private: sessionInfo.conversationType !== "group",
+            is_private: capturePool !== "family" && sessionInfo.conversationType !== "group",
             source_channel: sessionInfo.channel ?? "unknown",
             conversation_type: sessionInfo.conversationType ?? "unknown",
             chat_id: sessionInfo.chatId,
