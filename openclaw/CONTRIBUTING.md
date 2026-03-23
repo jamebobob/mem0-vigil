@@ -7,17 +7,26 @@ Guidelines for the OpenClaw Mem0 plugin in the jamebobob/mem0-vigil fork.
 ## Multi-Pool Architecture
 
 The plugin routes memory reads and writes to named Qdrant pools based
-on agent identity. This prevents private DM memories from leaking into
-group chat contexts.
+on agent identity. Each Telegram group gets its own pool, preventing
+private DM memories from leaking into group chat contexts and keeping
+group memories isolated from each other.
 
 **Config** (`agentMemory` in openclaw.json):
 
 ```json
 "agentMemory": {
-  "main":   { "capture": "jamebob", "recall": ["jamebob", "family"] },
-  "social": { "capture": "family",  "recall": ["family"] }
+  "main":              { "capture": "operator", "recall": ["operator", "household", "friends", "family", "parents", "partner"] },
+  "social-household":  { "capture": "household",  "recall": ["household"] },
+  "social-friends":       { "capture": "friends",       "recall": ["friends"] },
+  "social-family":    { "capture": "family",     "recall": ["family"] },
+  "social-parents":    { "capture": "parents",     "recall": ["parents"] },
+  "social-partner":   { "capture": "partner",    "recall": ["partner"] }
 }
 ```
+
+The `main` agent handles private DMs: it captures to the `operator` pool
+and recalls from all pools. Each `social-*` agent is bound to a single
+Telegram group and captures/recalls only within that group's pool.
 
 **Four helper functions** (inside `register()` in index.ts):
 

@@ -16,19 +16,19 @@ import { mem0ConfigSchema } from "./index.ts";
 describe("mem0ConfigSchema agentMemory", () => {
   const base = {
     mode: "open-source" as const,
-    userId: "jamebob",
+    userId: "operator",
   };
 
   it("parses agentMemory with capture and recall arrays", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "jamebob", recall: ["jamebob", "family"] },
+        main: { capture: "operator", recall: ["operator", "family"] },
         social: { capture: "family", recall: ["family"] },
       },
     });
     expect(cfg.agentMemory).toEqual({
-      main: { capture: "jamebob", recall: ["jamebob", "family"] },
+      main: { capture: "operator", recall: ["operator", "family"] },
       social: { capture: "family", recall: ["family"] },
     });
   });
@@ -37,20 +37,20 @@ describe("mem0ConfigSchema agentMemory", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { recall: ["jamebob"] },
+        main: { recall: ["operator"] },
       },
     });
-    expect(cfg.agentMemory?.main.capture).toBe("jamebob");
+    expect(cfg.agentMemory?.main.capture).toBe("operator");
   });
 
   it("defaults recall to [userId] when not specified", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "jamebob" },
+        main: { capture: "operator" },
       },
     });
-    expect(cfg.agentMemory?.main.recall).toEqual(["jamebob"]);
+    expect(cfg.agentMemory?.main.recall).toEqual(["operator"]);
   });
 
   it("returns undefined agentMemory when not provided", () => {
@@ -67,13 +67,13 @@ describe("mem0ConfigSchema agentMemory", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "jamebob", recall: ["jamebob"] },
+        main: { capture: "operator", recall: ["operator"] },
         bad: "not-an-object",
         worse: null,
       },
     });
     expect(cfg.agentMemory).toEqual({
-      main: { capture: "jamebob", recall: ["jamebob"] },
+      main: { capture: "operator", recall: ["operator"] },
     });
   });
 
@@ -81,10 +81,10 @@ describe("mem0ConfigSchema agentMemory", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "jamebob", recall: ["jamebob", 42, null, "family"] },
+        main: { capture: "operator", recall: ["operator", 42, null, "family"] },
       },
     });
-    expect(cfg.agentMemory?.main.recall).toEqual(["jamebob", "family"]);
+    expect(cfg.agentMemory?.main.recall).toEqual(["operator", "family"]);
   });
 });
 

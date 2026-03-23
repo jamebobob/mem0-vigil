@@ -48,7 +48,7 @@ describe("logRecallEvent JSONL", () => {
         { id: "aaa", score: 0.85 },
         { id: "bbb", score: 0.60 },
       ],
-      pools: ["jamebob"],
+      pools: ["operator"],
       recallType: "auto",
       threshold: 0.5,
       resolvePath,
@@ -69,7 +69,7 @@ describe("logRecallEvent JSONL", () => {
     expect(record.top_score).toBe(0.85);
     expect(record.scores).toEqual([0.85, 0.60]);
     expect(record.point_ids).toEqual(["aaa", "bbb"]);
-    expect(record.pool).toBe("jamebob");
+    expect(record.pool).toBe("operator");
     expect(record.filtered_by_guard).toBe(0);
     expect(record.recall_type).toBe("auto");
     expect(record.gap).toBeUndefined(); // not a gap
@@ -82,7 +82,7 @@ describe("logRecallEvent JSONL", () => {
       ctx: "dm",
       query: "multi pool",
       results: [{ id: "x", score: 0.7 }],
-      pools: ["jamebob", "family"],
+      pools: ["operator", "family"],
       recallType: "auto",
       threshold: 0.5,
       resolvePath,
@@ -94,7 +94,7 @@ describe("logRecallEvent JSONL", () => {
       resolvePath(`memory/recall-events-${month}.jsonl`),
       "utf-8",
     ).trim();
-    expect(JSON.parse(line).pool).toBe("jamebob,family");
+    expect(JSON.parse(line).pool).toBe("operator,family");
   });
 
   it("defaults filteredByGuard to 0", () => {
@@ -175,7 +175,7 @@ describe("logRecallEvent gap detection", () => {
       ctx: "dm",
       query: "low relevance",
       results: [{ id: "z", score: 0.3 }],
-      pools: ["jamebob"],
+      pools: ["operator"],
       recallType: "explicit",
       threshold: 0.5,
       resolvePath,
@@ -196,7 +196,7 @@ describe("logRecallEvent gap detection", () => {
       ctx: "dm",
       query: "good match",
       results: [{ id: "a", score: 0.8 }],
-      pools: ["jamebob"],
+      pools: ["operator"],
       recallType: "auto",
       threshold: 0.5,
       resolvePath,
@@ -244,7 +244,7 @@ describe("logRecallEvent gap journal", () => {
       ctx: "dm",
       query: "good query",
       results: [{ id: "a", score: 0.9 }],
-      pools: ["jamebob"],
+      pools: ["operator"],
       recallType: "auto",
       threshold: 0.5,
       resolvePath,

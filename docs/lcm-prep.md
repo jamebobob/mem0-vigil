@@ -112,7 +112,7 @@ behavior on gateway):
 
 1. Enable lossless-claw on main agent only
 2. Chat until compaction triggers (send enough messages to exceed `contextThreshold`)
-3. After compaction, ask the assistant about her Safety rules and Memory Rules
+3. After compaction, ask the agent about its Safety rules and Memory Rules
 4. If she answers with specific rules: sections survived (as summary or bootstrap context)
 5. If she answers vaguely: sections were over-compressed, deploy sticky-context mitigation
 6. Regardless: verify sticky-context slots survive compaction (expected YES)
@@ -194,9 +194,9 @@ sudo journalctl -u <gateway-service-name> --since "1 min ago" | grep -i lossless
 # 7. Restart gateway
 sudo systemctl restart <gateway-service-name>
 
-# 8. Test Q4: Chat with the assistant until compaction triggers
+# 8. Test Q4: Chat with the agent until compaction triggers
 #    Send enough messages to exceed 75% of context window
-#    After compaction, ask the assistant to recall her Safety rules
+#    After compaction, ask the agent to recall her Safety rules
 #    If she can: Q4 = YES
 #    If she can't: DISABLE LCM IMMEDIATELY
 
@@ -248,11 +248,11 @@ If Q4 fails:
 
 **Quick detection** (within 5 minutes):
 
-1. **the assistant stops responding**: Gateway crashed or LCM assembly broke the prompt.
+1. **Agent stops responding**: Gateway crashed or LCM assembly broke the prompt.
    Action: `sudo systemctl status <gateway-service-name>`, check logs.
 
-2. **the assistant responds but has amnesia**: postCompactionSections not working.
-   Action: Ask the assistant about her Safety rules. If blank: disable LCM.
+2. **Agent responds but has amnesia**: postCompactionSections not working.
+   Action: Ask the agent about its Safety rules. If blank: disable LCM.
 
 3. **Qdrant memory count spikes**: Re-extraction loop (summaries being captured as memories).
    Action: Check `python3 ~/.openclaw/workspace/qdrant-health.py` before and after.

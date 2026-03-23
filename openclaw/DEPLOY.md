@@ -1,16 +1,16 @@
 # Deploying the Mem0 Fork to Gateway
 
-Step-by-step guide for switching gateway's openclaw-mem0 plugin from
+Step-by-step guide for switching homeserver's openclaw-mem0 plugin from
 patched node_modules to the jamebobob/mem0-vigil fork.
 
-**Audience:** A future Opus or Claude Code session deploying to gateway
+**Audience:** A future Opus or Claude Code session deploying to homeserver
 without prior context. Commands are copy-pasteable.
 
 **Canonical roadmap:** `~/Downloads/project-vigil-v5.md`
 
 ---
 
-## Pre-Deploy Checklist (run on gateway)
+## Pre-Deploy Checklist (run on homeserver)
 
 ### 1. Qdrant snapshot
 
@@ -38,7 +38,7 @@ cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak.pre-fork
 
 ```bash
 cp ~/.openclaw/workspace/AGENTS.md ~/.openclaw/workspace/AGENTS.md.bak.pre-fork
-# If social agent has its own AGENTS.md, back that up too:
+# If social-* agents have their own AGENTS.md, back those up too:
 ls ~/.openclaw/workspace/agents/*/AGENTS.md 2>/dev/null && \
   for f in ~/.openclaw/workspace/agents/*/AGENTS.md; do cp "$f" "${f}.bak.pre-fork"; done
 ```
@@ -126,7 +126,7 @@ This tells OpenClaw to load the plugin from the fork's build output
 creates a symlink (no copy), so rebuilding the fork automatically
 updates the plugin.
 
-**Verify on gateway:** Check that `openclaw.json` now references the
+**Verify on homeserver:** Check that `openclaw.json` now references the
 fork path. Look for `plugins.load.paths` containing the fork path,
 or check that the `openclaw-mem0` entry is still enabled:
 
@@ -170,10 +170,10 @@ output and plugin link.
 
 ## Post-Deploy Verification
 
-### 1. the assistant responds on Telegram
+### 1. Agent responds on Telegram
 
-- Send a DM to the assistant. She should respond normally.
-- Send a message in the family group. Social agent should respond.
+- Send a DM to your agent. It should respond normally.
+- Send a message in a group. The corresponding social-* agent should respond.
 - If either agent is unresponsive, check gateway logs immediately.
 
 ### 2. Qdrant health
@@ -206,6 +206,30 @@ sudo journalctl -u <gateway-service-name> --since "5 min ago" | grep "auto-captu
 ```bash
 sudo journalctl -u <gateway-service-name> --since "10 min ago" | grep -i "error\|warn" | grep mem0
 ```
+
+---
+
+## Adding a New Group (Per-Group Configuration)
+
+When the agent joins a new Telegram group, five things must be configured
+before the group's memories are captured and recalled correctly:
+
+1. **Agent entry** -- Add a `social-<group>` agent to `agents.list`
+2. **Binding** -- Bind the new agent to the Telegram group's chat ID
+3. **agentMemory entry** -- Add a `"social-<group>"` key to the
+   `agentMemory` block in `openclaw.json` with `capture` and `recall`
+   set to the new pool name
+4. **Main's recall array** -- Add the new pool name to `main`'s
+   `recall` array so the DM agent can search the group's memories
+5. **Workspace directory** -- Create the agent's workspace directory
+   under `~/.openclaw/workspace/agents/`
+
+**Operational tool:** Use `~/bin/provision-group.sh` on homeserver to
+automate these steps. The script handles all five in sequence and
+validates the result.
+
+After provisioning, restart the gateway via `systemctl` (not the
+openclaw CLI) and verify the new agent responds in the group.
 
 ---
 
@@ -275,8 +299,8 @@ curl -X PUT "http://localhost:6333/collections/memories/snapshots/recover" \
   the gateway.** These cause blackouts. Use `systemctl` for service
   management. (`openclaw plugins install` is safe — it modifies
   config without restarting the running process.)
-- **Don't deploy on a day when gateway can't be monitored** for at
-  least 2-3 hours afterward. the assistant needs to be observed in both DM
+- **Don't deploy on a day when homeserver can't be monitored** for at
+  least 2-3 hours afterward. The agent needs to be observed in both DM
   and group contexts.
 - **Don't deploy the recall guard without completing the family pool
   `is_private` audit.** See Vigil v5 "Day 3 pre-deploy step" for

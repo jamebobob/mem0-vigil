@@ -11,7 +11,7 @@ Deep source code analysis of OpenClaw v2026.3.13 core and
 mechanism is bypassed entirely. However, AGENTS.md sections likely
 survive through a different path: the system prompt is rebuilt by the
 core every turn and LCM does not replace it. Runtime testing required
-to confirm the sections the assistant needs are actually in the system prompt
+to confirm the sections the agent needs are actually in the system prompt
 and not only in the bootstrap context message.
 
 ---
@@ -206,7 +206,7 @@ When LCM compacts:
 - The specific sections are compressed, not literally preserved
 - The summary is still accessible via `lcm_expand` tools
 
-### What this means for the assistant's sections
+### What this means for the agent's sections
 
 The Safety and Memory Rules sections from AGENTS.md will be:
 - **Literally present** in the first few conversations (before compaction)
@@ -269,7 +269,7 @@ specificity that makes these sections effective may be lost.
 
 1. Enable LCM on main agent
 2. Chat until compaction triggers
-3. Ask the assistant: "What are your Safety rules?" and "What are your Memory Rules?"
+3. Ask the agent: "What are your Safety rules?" and "What are your Memory Rules?"
 4. If she answers with specific rules: sections survived (as bootstrap context or summary)
 5. If she answers vaguely: sections were over-compressed. Deploy sticky-context mitigation.
 6. Regardless: verify sticky-context slots survive compaction (expected YES since they're prompt-time injection)

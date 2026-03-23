@@ -15,7 +15,7 @@ function makeResult(overrides: Partial<GuardableResult> = {}): GuardableResult {
     id: "test-id",
     memory: "test memory",
     score: 0.8,
-    user_id: "jamebob",
+    user_id: "operator",
     metadata: {},
     ...overrides,
   };
@@ -55,7 +55,7 @@ describe("applyRecallGuard — group (deny-private)", () => {
   it("filters results from pools not in allowed_pools", () => {
     const results = [
       makeResult({ id: "1", user_id: "family", metadata: {} }),
-      makeResult({ id: "2", user_id: "jamebob", metadata: {} }),
+      makeResult({ id: "2", user_id: "operator", metadata: {} }),
     ];
     const out = applyRecallGuard({ results, ctx: "group", config: defaultCfg });
     expect(out.results.map((r) => r.id)).toEqual(["1"]);
@@ -65,7 +65,7 @@ describe("applyRecallGuard — group (deny-private)", () => {
   it("filters both: private + wrong pool", () => {
     const results = [
       makeResult({ id: "1", user_id: "family", metadata: { is_private: true } }),
-      makeResult({ id: "2", user_id: "jamebob", metadata: { is_private: false } }),
+      makeResult({ id: "2", user_id: "operator", metadata: { is_private: false } }),
       makeResult({ id: "3", user_id: "family", metadata: { is_private: false } }),
     ];
     const out = applyRecallGuard({ results, ctx: "group", config: defaultCfg });
@@ -99,7 +99,7 @@ describe("applyRecallGuard — cron (deny-private)", () => {
 
   it("does not filter by pool (no allowed_pools in cron config)", () => {
     const results = [
-      makeResult({ id: "1", user_id: "jamebob", metadata: {} }),
+      makeResult({ id: "1", user_id: "operator", metadata: {} }),
       makeResult({ id: "2", user_id: "family", metadata: {} }),
     ];
     const out = applyRecallGuard({ results, ctx: "cron", config: defaultCfg });

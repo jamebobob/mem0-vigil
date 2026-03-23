@@ -32,13 +32,35 @@ All new parameters are optional and backward-compatible — existing configurati
 
 ### Per-agent memory isolation
 
-In multi-agent setups, each agent automatically gets its own memory namespace. Session keys following the pattern `agent:<agentId>:<uuid>` are parsed to derive isolated namespaces (`${userId}:agent:${agentId}`). Single-agent deployments are unaffected — plain session keys and `agent:main:*` keys resolve to the configured `userId`.
+In multi-agent setups, each agent gets its own memory pool. The deployment uses a per-group model: one `main` agent for private DMs, plus a dedicated `social-*` agent per Telegram group. Each group's memories are captured into its own named pool, and recall is scoped to only the pools that agent is allowed to read.
+
+**Production config** (`agentMemory` in openclaw.json):
+
+```json
+{
+  "main": { "capture": "operator", "recall": ["operator", "household", "friends", "family", "parents", "partner"] },
+  "social-household": { "capture": "household", "recall": ["household"] },
+  "social-friends": { "capture": "friends", "recall": ["friends"] },
+  "social-family": { "capture": "family", "recall": ["family"] },
+  "social-parents": { "capture": "parents", "recall": ["parents"] },
+  "social-partner": { "capture": "partner", "recall": ["partner"] }
+}
+```
+
+Each group gets its own pool (e.g. `household`, `family`). The `main` agent captures to the private `operator` pool and recalls from all pools. Each `social-*` agent captures and recalls only within its own group pool.
+
+**Fail-closed chain:**
+
+1. **Config parser** rejects invalid `agentMemory` entries at startup
+2. **Pool routing** returns `undefined` (capture) or `[]` (recall) for unmapped agents -- no default fallback
+3. **Provenance** uses `conversationType` only (not pool names) to tag memories
+4. **Recall guard** handles `is_private` filtering at query time
 
 **How it works:**
 
 - The agent's session key is inspected on every recall/capture cycle
-- If the key matches `agent:<name>:<uuid>`, memories are stored under `userId:agent:<name>`
-- Different agents never see each other's memories unless explicitly queried
+- If the key matches `agent:<name>:<uuid>`, memories are routed to the pools defined in that agent's `agentMemory` entry
+- Social agents never see other groups' memories; only `main` has cross-pool recall
 
 **Explicit cross-agent queries:**
 
