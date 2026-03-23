@@ -1,28 +1,17 @@
 /**
  * Recall Guard (Vigil A2)
  *
- * Filters recall results by session context before injection into the
- * agent prompt. Prevents private DM memories from leaking into group
- * chat, cron jobs, or social agent context.
+ * Convention-based recall filter. No config file needed — new agents
+ * just work based on their ID prefix.
  *
- * Three modes (per context):
- *   - allow-all (dm): all results pass, no filtering.
- *   - deny-private (group): results with is_private=true are removed.
- *     If allowed_pools is set, results from unlisted pools are also removed.
- *   - deny-private (cron): same as group but without pool allowlist.
+ * Rules:
+ *   - agentId "main": all results pass (operator sees everything, cron runs as main)
+ *   - agentId "social-*": keep only results where user_id matches the pool
+ *     name (agentId minus "social-" prefix) AND is_private !== true
+ *   - any other agentId: fail-closed, return empty results
  *
  * Separate file from telemetry for independent revert capability.
  */
-
-import { readFileSync, existsSync } from "node:fs";
-import defaultConfig from "./memory-views.default.json" with { type: "json" };
-
-export interface MemoryViewConfig {
-  views: Record<string, {
-    mode: "allow-all" | "deny-private";
-    allowed_pools?: string[];
-  }>;
-}
 
 export interface GuardableResult {
   id: string;
@@ -38,30 +27,6 @@ export interface GuardOutput<T extends GuardableResult> {
 }
 
 /**
- * Load memory-views config from a runtime path, falling back to the
- * bundled default if the file doesn't exist or can't be parsed.
- */
-export function loadMemoryViewsConfig(
-  resolvePath?: (p: string) => string,
-): MemoryViewConfig {
-  if (resolvePath) {
-    try {
-      const runtimePath = resolvePath("memory-views.json");
-      if (existsSync(runtimePath)) {
-        const raw = readFileSync(runtimePath, "utf-8");
-        const parsed = JSON.parse(raw);
-        if (parsed?.views && typeof parsed.views === "object") {
-          return parsed as MemoryViewConfig;
-        }
-      }
-    } catch {
-      // Fall through to default
-    }
-  }
-  return defaultConfig as MemoryViewConfig;
-}
-
-/**
  * Apply the recall guard to a set of search results.
  *
  * Returns the filtered results and the count of removed items (for
@@ -69,32 +34,31 @@ export function loadMemoryViewsConfig(
  */
 export function applyRecallGuard<T extends GuardableResult>(opts: {
   results: T[];
-  ctx: string; // "dm" | "group" | "cron"
-  config: MemoryViewConfig;
+  agentId: string;
 }): GuardOutput<T> {
-  const { results, ctx, config } = opts;
-  const view = config.views[ctx];
+  const { results, agentId } = opts;
 
-  // Unknown context or allow-all: pass everything through
-  if (!view || view.mode === "allow-all") {
+  // Main agent sees everything (cron also runs as main)
+  if (agentId === "main") {
     return { results, removedCount: 0 };
   }
 
-  // deny-private mode
-  const filtered = results.filter((r) => {
-    // Filter out results marked as private
-    if (r.metadata?.is_private === true) return false;
+  // Social agents: pool name derived from agent ID
+  if (agentId.startsWith("social-")) {
+    const allowedPool = agentId.slice(7); // strip "social-"
+    const filtered = results.filter((r) => {
+      // Drop private results
+      if (r.metadata?.is_private === true) return false;
+      // Keep only results from this agent's pool
+      if (r.user_id !== allowedPool) return false;
+      return true;
+    });
+    return {
+      results: filtered,
+      removedCount: results.length - filtered.length,
+    };
+  }
 
-    // If allowed_pools is set, filter out results from unlisted pools
-    if (view.allowed_pools && r.user_id) {
-      if (!view.allowed_pools.includes(r.user_id)) return false;
-    }
-
-    return true;
-  });
-
-  return {
-    results: filtered,
-    removedCount: results.length - filtered.length,
-  };
+  // Unknown agent: fail-closed
+  return { results: [], removedCount: results.length };
 }

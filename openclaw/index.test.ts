@@ -16,41 +16,43 @@ import { mem0ConfigSchema } from "./index.ts";
 describe("mem0ConfigSchema agentMemory", () => {
   const base = {
     mode: "open-source" as const,
-    userId: "operator",
+    userId: "testuser",
   };
 
   it("parses agentMemory with capture and recall arrays", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "operator", recall: ["operator", "family"] },
+        main: { capture: "testuser", recall: ["testuser", "family"] },
         social: { capture: "family", recall: ["family"] },
       },
     });
     expect(cfg.agentMemory).toEqual({
-      main: { capture: "operator", recall: ["operator", "family"] },
+      main: { capture: "testuser", recall: ["testuser", "family"] },
       social: { capture: "family", recall: ["family"] },
     });
   });
 
-  it("defaults capture to userId when not specified", () => {
+  it("skips entry when capture is missing (fail-closed)", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { recall: ["operator"] },
+        main: { recall: ["testuser"] },
       },
     });
-    expect(cfg.agentMemory?.main.capture).toBe("operator");
+    // Fail-closed: missing capture → entry skipped entirely
+    expect(cfg.agentMemory).toBeUndefined();
   });
 
-  it("defaults recall to [userId] when not specified", () => {
+  it("skips entry when recall is missing (fail-closed)", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "operator" },
+        main: { capture: "testuser" },
       },
     });
-    expect(cfg.agentMemory?.main.recall).toEqual(["operator"]);
+    // Fail-closed: missing recall → entry skipped entirely
+    expect(cfg.agentMemory).toBeUndefined();
   });
 
   it("returns undefined agentMemory when not provided", () => {
@@ -67,13 +69,13 @@ describe("mem0ConfigSchema agentMemory", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "operator", recall: ["operator"] },
+        main: { capture: "testuser", recall: ["testuser"] },
         bad: "not-an-object",
         worse: null,
       },
     });
     expect(cfg.agentMemory).toEqual({
-      main: { capture: "operator", recall: ["operator"] },
+      main: { capture: "testuser", recall: ["testuser"] },
     });
   });
 
@@ -81,10 +83,10 @@ describe("mem0ConfigSchema agentMemory", () => {
     const cfg = mem0ConfigSchema.parse({
       ...base,
       agentMemory: {
-        main: { capture: "operator", recall: ["operator", 42, null, "family"] },
+        main: { capture: "testuser", recall: ["testuser", 42, null, "family"] },
       },
     });
-    expect(cfg.agentMemory?.main.recall).toEqual(["operator", "family"]);
+    expect(cfg.agentMemory?.main.recall).toEqual(["testuser", "family"]);
   });
 });
 

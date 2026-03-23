@@ -1,7 +1,0 @@
-{
-  "views": {
-    "dm": { "mode": "allow-all" },
-    "group": { "mode": "deny-private" },
-    "cron": { "mode": "deny-private" }
-  }
-}

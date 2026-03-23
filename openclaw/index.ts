@@ -20,8 +20,7 @@ import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { logRecallEvent, mapCtx } from "./recall-telemetry.js";
 import { filterCaptureMessages } from "./capture-filter.js";
-import { applyRecallGuard, loadMemoryViewsConfig } from "./recall-guard.js";
-import type { MemoryViewConfig } from "./recall-guard.js";
+import { applyRecallGuard } from "./recall-guard.js";
 
 // ============================================================================
 // Types
@@ -686,11 +685,6 @@ const memoryPlugin = {
     // Track current session ID for tool-level session scoping
     let currentSessionId: string | undefined;
     let currentAgentId: string | undefined;
-
-    // Load recall guard config (runtime file or bundled default)
-    const memoryViewsConfig: MemoryViewConfig = loadMemoryViewsConfig(
-      (p) => api.resolvePath(p),
-    );
 
     api.logger.info(
       `openclaw-mem0: registered (mode: ${cfg.mode}, user: ${cfg.userId}, graph: ${cfg.enableGraph}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
@@ -1600,15 +1594,14 @@ const memoryPlugin = {
           allResults.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
           allResults = allResults.slice(0, cfg.topK);
 
-          // Recall guard: filter by session context (privacy boundaries)
+          // Recall guard: convention-based pool filtering
           const sessionInfo = extractSessionInfo(sessionId);
           const ctxType = mapCtx(sessionInfo.conversationType);
           let filteredByGuard = 0;
           try {
             const guardResult = applyRecallGuard({
               results: allResults,
-              ctx: ctxType,
-              config: memoryViewsConfig,
+              agentId: agentId ?? "main",
             });
             allResults = guardResult.results;
             filteredByGuard = guardResult.removedCount;
