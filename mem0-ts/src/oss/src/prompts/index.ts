@@ -281,14 +281,19 @@ export function parseMessages(messages: string[]): string {
 export function removeCodeBlocks(text: string): string {
   // Extract content inside code fences, handling both complete and
   // truncated blocks (where the closing ``` never arrives).
+  const hadFences = /```/.test(text);
   let cleaned = text.replace(/```(?:\w+)?\n?([\s\S]*?)(?:```|$)/g, "$1").trim();
   try {
     JSON.parse(cleaned);
     return cleaned;
   } catch (e) {
-    // If the cleaned text isn't valid JSON, try to extract the first
-    // JSON object — handles cases where the LLM wraps JSON in prose.
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    return match ? match[0] : cleaned;
+    // If no code fences were present and the cleaned text isn't valid JSON,
+    // try to extract the first JSON object — handles cases where the LLM
+    // wraps JSON in prose without code fences.
+    if (!hadFences) {
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      return match ? match[0] : cleaned;
+    }
+    return cleaned;
   }
 }
