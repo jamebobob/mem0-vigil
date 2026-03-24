@@ -12,647 +12,51 @@
  * - Auto-capture: stores key facts scoped to the current session after each agent turn
  * - Multi-pool memory: agents write/read from configurable named pools (via agentMemory
  *   config) with fail-closed boundary enforcement and provenance metadata
+ * - Per-agent isolation: multi-agent setups write/read from separate userId namespaces
+ *   automatically via sessionKey routing (zero breaking changes for single-agent setups)
  * - CLI: openclaw mem0 search, openclaw mem0 stats
  * - Dual mode: platform or open-source (self-hosted)
  */
 
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+
+import type {
+  Mem0Config,
+  Mem0Provider,
+  MemoryItem,
+  AddOptions,
+  SearchOptions,
+} from "./types.ts";
+import { createProvider } from "./providers.ts";
+import { mem0ConfigSchema } from "./config.ts";
+import {
+  filterMessagesForExtraction,
+} from "./filtering.ts";
+import {
+  effectiveUserId,
+  agentUserId,
+  resolveUserId,
+  isNonInteractiveTrigger,
+  isSubagentSession,
+} from "./isolation.ts";
 import { logRecallEvent, mapCtx } from "./recall-telemetry.js";
 import { filterCaptureMessages } from "./capture-filter.js";
 import { applyRecallGuard } from "./recall-guard.js";
 
 // ============================================================================
-// Types
+// Re-exports (for tests and external consumers)
 // ============================================================================
 
-type Mem0Mode = "platform" | "open-source";
-
-type Mem0Config = {
-  mode: Mem0Mode;
-  // Platform-specific
-  apiKey?: string;
-  orgId?: string;
-  projectId?: string;
-  customInstructions: string;
-  customCategories: Record<string, string>;
-  enableGraph: boolean;
-  // OSS-specific
-  customPrompt?: string;
-  oss?: {
-    embedder?: { provider: string; config: Record<string, unknown> };
-    vectorStore?: { provider: string; config: Record<string, unknown> };
-    llm?: { provider: string; config: Record<string, unknown> };
-    historyDbPath?: string;
-    disableHistory?: boolean;
-  };
-  // Shared
-  userId: string;
-  autoCapture: boolean;
-  autoRecall: boolean;
-  searchThreshold: number;
-  topK: number;
-  agentMemory?: Record<string, { capture: string; recall: string[] }>;
-};
-
-// Unified types for the provider interface
-interface AddOptions {
-  user_id: string;
-  run_id?: string;
-  custom_instructions?: string;
-  custom_categories?: Array<Record<string, string>>;
-  enable_graph?: boolean;
-  output_format?: string;
-  source?: string;
-  metadata?: Record<string, unknown>;
-}
-
-interface SearchOptions {
-  user_id: string;
-  run_id?: string;
-  top_k?: number;
-  threshold?: number;
-  limit?: number;
-  keyword_search?: boolean;
-  reranking?: boolean;
-  source?: string;
-}
-
-interface ListOptions {
-  user_id: string;
-  run_id?: string;
-  page_size?: number;
-  source?: string;
-}
-
-interface MemoryItem {
-  id: string;
-  memory: string;
-  user_id?: string;
-  score?: number;
-  categories?: string[];
-  metadata?: Record<string, unknown>;
-  created_at?: string;
-  updated_at?: string;
-}
-
-interface AddResultItem {
-  id: string;
-  memory: string;
-  event: "ADD" | "UPDATE" | "DELETE" | "NOOP";
-}
-
-interface AddResult {
-  results: AddResultItem[];
-}
-
-// ============================================================================
-// Unified Provider Interface
-// ============================================================================
-
-interface Mem0Provider {
-  add(
-    messages: Array<{ role: string; content: string }>,
-    options: AddOptions,
-  ): Promise<AddResult>;
-  search(query: string, options: SearchOptions): Promise<MemoryItem[]>;
-  get(memoryId: string): Promise<MemoryItem>;
-  getAll(options: ListOptions): Promise<MemoryItem[]>;
-  delete(memoryId: string): Promise<void>;
-}
-
-// ============================================================================
-// Platform Provider (Mem0 Cloud)
-// ============================================================================
-
-class PlatformProvider implements Mem0Provider {
-  private client: any; // MemoryClient from mem0ai
-  private initPromise: Promise<void> | null = null;
-
-  constructor(
-    private readonly apiKey: string,
-    private readonly orgId?: string,
-    private readonly projectId?: string,
-  ) { }
-
-  private async ensureClient(): Promise<void> {
-    if (this.client) return;
-    if (this.initPromise) return this.initPromise;
-    this.initPromise = this._init().catch((err) => {
-      this.initPromise = null;
-      throw err;
-    });
-    return this.initPromise;
-  }
-
-  private async _init(): Promise<void> {
-    const { default: MemoryClient } = await import("mem0ai");
-    const opts: { apiKey: string; org_id?: string; project_id?: string } = { apiKey: this.apiKey };
-    if (this.orgId) opts.org_id = this.orgId;
-    if (this.projectId) opts.project_id = this.projectId;
-    this.client = new MemoryClient(opts);
-  }
-
-  async add(
-    messages: Array<{ role: string; content: string }>,
-    options: AddOptions,
-  ): Promise<AddResult> {
-    await this.ensureClient();
-    const opts: Record<string, unknown> = { user_id: options.user_id };
-    if (options.run_id) opts.run_id = options.run_id;
-    if (options.custom_instructions)
-      opts.custom_instructions = options.custom_instructions;
-    if (options.custom_categories)
-      opts.custom_categories = options.custom_categories;
-    if (options.enable_graph) opts.enable_graph = options.enable_graph;
-    if (options.output_format) opts.output_format = options.output_format;
-    if (options.source) opts.source = options.source;
-
-    const result = await this.client.add(messages, opts);
-    return normalizeAddResult(result);
-  }
-
-  async search(query: string, options: SearchOptions): Promise<MemoryItem[]> {
-    await this.ensureClient();
-    const filters: Record<string, unknown> = { user_id: options.user_id };
-    if (options.run_id) filters.run_id = options.run_id;
-
-    const opts: Record<string, unknown> = {
-      api_version: "v2",
-      filters,
-    };
-    if (options.top_k != null) opts.top_k = options.top_k;
-    if (options.threshold != null) opts.threshold = options.threshold;
-    if (options.keyword_search != null) opts.keyword_search = options.keyword_search;
-    if (options.reranking != null) opts.rerank = options.reranking;
-
-    const results = await this.client.search(query, opts);
-    return normalizeSearchResults(results);
-  }
-
-  async get(memoryId: string): Promise<MemoryItem> {
-    await this.ensureClient();
-    const result = await this.client.get(memoryId);
-    return normalizeMemoryItem(result);
-  }
-
-  async getAll(options: ListOptions): Promise<MemoryItem[]> {
-    await this.ensureClient();
-    const opts: Record<string, unknown> = { user_id: options.user_id };
-    if (options.run_id) opts.run_id = options.run_id;
-    if (options.page_size != null) opts.page_size = options.page_size;
-    if (options.source) opts.source = options.source;
-
-    const results = await this.client.getAll(opts);
-    if (Array.isArray(results)) return results.map(normalizeMemoryItem);
-    // Some versions return { results: [...] }
-    if (results?.results && Array.isArray(results.results))
-      return results.results.map(normalizeMemoryItem);
-    return [];
-  }
-
-  async delete(memoryId: string): Promise<void> {
-    await this.ensureClient();
-    await this.client.delete(memoryId);
-  }
-}
-
-// ============================================================================
-// Open-Source Provider (Self-hosted)
-// ============================================================================
-
-class OSSProvider implements Mem0Provider {
-  private memory: any; // Memory from mem0ai/oss
-  private initPromise: Promise<void> | null = null;
-
-  constructor(
-    private readonly ossConfig?: Mem0Config["oss"],
-    private readonly customPrompt?: string,
-    private readonly resolvePath?: (p: string) => string,
-  ) { }
-
-  private async ensureMemory(): Promise<void> {
-    if (this.memory) return;
-    if (this.initPromise) return this.initPromise;
-    this.initPromise = this._init().catch((err) => {
-      this.initPromise = null;
-      throw err;
-    });
-    return this.initPromise;
-  }
-
-  private async _init(): Promise<void> {
-    const { Memory } = await import("mem0ai/oss");
-
-    const config: Record<string, unknown> = { version: "v1.1" };
-
-    if (this.ossConfig?.embedder) config.embedder = this.ossConfig.embedder;
-    if (this.ossConfig?.vectorStore)
-      config.vectorStore = this.ossConfig.vectorStore;
-    if (this.ossConfig?.llm) config.llm = this.ossConfig.llm;
-
-    if (this.ossConfig?.historyDbPath) {
-      const dbPath = this.resolvePath
-        ? this.resolvePath(this.ossConfig.historyDbPath)
-        : this.ossConfig.historyDbPath;
-      config.historyDbPath = dbPath;
-    }
-
-    if (this.ossConfig?.disableHistory) {
-      config.disableHistory = true;
-    }
-
-    if (this.customPrompt) config.customPrompt = this.customPrompt;
-
-    try {
-      this.memory = new Memory(config);
-    } catch (err) {
-      // If initialization fails (e.g. native SQLite binding resolution under
-      // jiti), retry with history disabled — the history DB is the most common
-      // source of native-binding failures and is not required for core
-      // memory operations.
-      if (!config.disableHistory) {
-        console.warn(
-          "[mem0] Memory initialization failed, retrying with history disabled:",
-          err instanceof Error ? err.message : err,
-        );
-        config.disableHistory = true;
-        this.memory = new Memory(config);
-      } else {
-        throw err;
-      }
-    }
-  }
-
-  async add(
-    messages: Array<{ role: string; content: string }>,
-    options: AddOptions,
-  ): Promise<AddResult> {
-    await this.ensureMemory();
-    // OSS SDK uses camelCase: userId/runId, not user_id/run_id
-    const addOpts: Record<string, unknown> = { userId: options.user_id };
-    if (options.run_id) addOpts.runId = options.run_id;
-    if (options.source) addOpts.source = options.source;
-    if (options.metadata) addOpts.metadata = options.metadata;
-    const result = await this.memory.add(messages, addOpts);
-    return normalizeAddResult(result);
-  }
-
-  async search(query: string, options: SearchOptions): Promise<MemoryItem[]> {
-    await this.ensureMemory();
-    // OSS SDK uses camelCase: userId/runId, not user_id/run_id
-    const opts: Record<string, unknown> = { userId: options.user_id };
-    if (options.run_id) opts.runId = options.run_id;
-    if (options.limit != null) opts.limit = options.limit;
-    else if (options.top_k != null) opts.limit = options.top_k;
-    if (options.keyword_search != null) opts.keyword_search = options.keyword_search;
-    if (options.reranking != null) opts.reranking = options.reranking;
-    if (options.source) opts.source = options.source;
-    if (options.threshold != null) opts.threshold = options.threshold;
-
-    const results = await this.memory.search(query, opts);
-    const normalized = normalizeSearchResults(results);
-
-    // Filter results by threshold if specified (client-side filtering as fallback)
-    if (options.threshold != null) {
-      return normalized.filter(item => (item.score ?? 0) >= options.threshold!);
-    }
-
-    return normalized;
-  }
-
-  async get(memoryId: string): Promise<MemoryItem> {
-    await this.ensureMemory();
-    const result = await this.memory.get(memoryId);
-    return normalizeMemoryItem(result);
-  }
-
-  async getAll(options: ListOptions): Promise<MemoryItem[]> {
-    await this.ensureMemory();
-    // OSS SDK uses camelCase: userId/runId, not user_id/run_id
-    const getAllOpts: Record<string, unknown> = { userId: options.user_id };
-    if (options.run_id) getAllOpts.runId = options.run_id;
-    if (options.source) getAllOpts.source = options.source;
-    const results = await this.memory.getAll(getAllOpts);
-    if (Array.isArray(results)) return results.map(normalizeMemoryItem);
-    if (results?.results && Array.isArray(results.results))
-      return results.results.map(normalizeMemoryItem);
-    return [];
-  }
-
-  async delete(memoryId: string): Promise<void> {
-    await this.ensureMemory();
-    await this.memory.delete(memoryId);
-  }
-}
-
-// ============================================================================
-// Result Normalizers
-// ============================================================================
-
-function normalizeMemoryItem(raw: any): MemoryItem {
-  return {
-    id: raw.id ?? raw.memory_id ?? "",
-    memory: raw.memory ?? raw.text ?? raw.content ?? "",
-    // Handle both platform (user_id, created_at) and OSS (userId, createdAt) field names
-    user_id: raw.user_id ?? raw.userId,
-    score: raw.score,
-    categories: raw.categories,
-    metadata: raw.metadata,
-    created_at: raw.created_at ?? raw.createdAt,
-    updated_at: raw.updated_at ?? raw.updatedAt,
-  };
-}
-
-function normalizeSearchResults(raw: any): MemoryItem[] {
-  // Platform API returns flat array, OSS returns { results: [...] }
-  if (Array.isArray(raw)) return raw.map(normalizeMemoryItem);
-  if (raw?.results && Array.isArray(raw.results))
-    return raw.results.map(normalizeMemoryItem);
-  return [];
-}
-
-function normalizeAddResult(raw: any): AddResult {
-  // Handle { results: [...] } shape (both platform and OSS)
-  if (raw?.results && Array.isArray(raw.results)) {
-    return {
-      results: raw.results.map((r: any) => ({
-        id: r.id ?? r.memory_id ?? "",
-        memory: r.memory ?? r.text ?? "",
-        // Platform API may return PENDING status (async processing)
-        // OSS stores event in metadata.event
-        event: r.event ?? r.metadata?.event ?? (r.status === "PENDING" ? "ADD" : "ADD"),
-      })),
-    };
-  }
-  // Platform API without output_format returns flat array
-  if (Array.isArray(raw)) {
-    return {
-      results: raw.map((r: any) => ({
-        id: r.id ?? r.memory_id ?? "",
-        memory: r.memory ?? r.text ?? "",
-        event: r.event ?? r.metadata?.event ?? (r.status === "PENDING" ? "ADD" : "ADD"),
-      })),
-    };
-  }
-  return { results: [] };
-}
-
-// ============================================================================
-// Config Parser
-// ============================================================================
-
-function resolveEnvVars(value: string): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
-    const envValue = process.env[envVar];
-    if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
-    }
-    return envValue;
-  });
-}
-
-function resolveEnvVarsDeep(obj: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (typeof value === "string") {
-      result[key] = resolveEnvVars(value);
-    } else if (value && typeof value === "object" && !Array.isArray(value)) {
-      result[key] = resolveEnvVarsDeep(value as Record<string, unknown>);
-    } else {
-      result[key] = value;
-    }
-  }
-  return result;
-}
-
-// ============================================================================
-// Default Custom Instructions & Categories
-// ============================================================================
-
-const DEFAULT_CUSTOM_INSTRUCTIONS = `Your Task: Extract and maintain a structured, evolving profile of the user from their conversations with an AI assistant. Capture information that would help the assistant provide personalized, context-aware responses in future interactions.
-
-Information to Extract:
-
-1. Identity & Demographics:
-   - Name, age, location, timezone, language preferences
-   - Occupation, employer, job role, industry
-   - Education background
-
-2. Preferences & Opinions:
-   - Communication style preferences (formal/casual, verbose/concise)
-   - Tool and technology preferences (languages, frameworks, editors, OS)
-   - Content preferences (topics of interest, learning style)
-   - Strong opinions or values they've expressed
-   - Likes and dislikes they've explicitly stated
-
-3. Goals & Projects:
-   - Current projects they're working on (name, description, status)
-   - Short-term and long-term goals
-   - Deadlines and milestones mentioned
-   - Problems they're actively trying to solve
-
-4. Technical Context:
-   - Tech stack and tools they use
-   - Skill level in different areas (beginner/intermediate/expert)
-   - Development environment and setup details
-   - Recurring technical challenges
-
-5. Relationships & People:
-   - Names and roles of people they mention (colleagues, family, friends)
-   - Team structure and dynamics
-   - Key contacts and their relevance
-
-6. Decisions & Lessons:
-   - Important decisions made and their reasoning
-   - Lessons learned from past experiences
-   - Strategies that worked or failed
-   - Changed opinions or updated beliefs
-
-7. Routines & Habits:
-   - Daily routines and schedules mentioned
-   - Work patterns (when they're productive, how they organize work)
-   - Health and wellness habits if voluntarily shared
-
-8. Life Events:
-   - Significant events (new job, moving, milestones)
-   - Upcoming events or plans
-   - Changes in circumstances
-
-Guidelines:
-- Store memories as clear, self-contained statements (each memory should make sense on its own)
-- Use third person: "User prefers..." not "I prefer..."
-- Include temporal context when relevant: "As of [date], user is working on..."
-- When information updates, UPDATE the existing memory rather than creating duplicates
-- Merge related facts into single coherent memories when possible
-- Preserve specificity: "User uses Next.js 14 with App Router" is better than "User uses React"
-- Capture the WHY behind preferences when stated: "User prefers Vim because of keyboard-driven workflow"
-
-Exclude:
-- Passwords, API keys, tokens, or any authentication credentials
-- Exact financial amounts (account balances, salaries) unless the user explicitly asks to remember them
-- Temporary or ephemeral information (one-time questions, debugging sessions with no lasting insight)
-- Generic small talk with no informational content
-- The assistant's own responses unless they contain a commitment or promise to the user
-- Raw code snippets (capture the intent/decision, not the code itself)
-- Information the user explicitly asks not to remember`;
-
-const DEFAULT_CUSTOM_CATEGORIES: Record<string, string> = {
-  identity:
-    "Personal identity information: name, age, location, timezone, occupation, employer, education, demographics",
-  preferences:
-    "Explicitly stated likes, dislikes, preferences, opinions, and values across any domain",
-  goals:
-    "Current and future goals, aspirations, objectives, targets the user is working toward",
-  projects:
-    "Specific projects, initiatives, or endeavors the user is working on, including status and details",
-  technical:
-    "Technical skills, tools, tech stack, development environment, programming languages, frameworks",
-  decisions:
-    "Important decisions made, reasoning behind choices, strategy changes, and their outcomes",
-  relationships:
-    "People mentioned by the user: colleagues, family, friends, their roles and relevance",
-  routines:
-    "Daily habits, work patterns, schedules, productivity routines, health and wellness habits",
-  life_events:
-    "Significant life events, milestones, transitions, upcoming plans and changes",
-  lessons:
-    "Lessons learned, insights gained, mistakes acknowledged, changed opinions or beliefs",
-  work:
-    "Work-related context: job responsibilities, workplace dynamics, career progression, professional challenges",
-  health:
-    "Health-related information voluntarily shared: conditions, medications, fitness, wellness goals",
-};
-
-// ============================================================================
-// Config Schema
-// ============================================================================
-
-const ALLOWED_KEYS = [
-  "mode",
-  "apiKey",
-  "userId",
-  "orgId",
-  "projectId",
-  "autoCapture",
-  "autoRecall",
-  "customInstructions",
-  "customCategories",
-  "customPrompt",
-  "enableGraph",
-  "searchThreshold",
-  "topK",
-  "oss",
-  "agentMemory",
-];
-
-function assertAllowedKeys(
-  value: Record<string, unknown>,
-  allowed: string[],
-  label: string,
-) {
-  const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
-  if (unknown.length === 0) return;
-  throw new Error(`${label} has unknown keys: ${unknown.join(", ")}`);
-}
-
-export const mem0ConfigSchema = {
-  parse(value: unknown): Mem0Config {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error("openclaw-mem0 config required");
-    }
-    const cfg = value as Record<string, unknown>;
-    assertAllowedKeys(cfg, ALLOWED_KEYS, "openclaw-mem0 config");
-
-    // Accept both "open-source" and legacy "oss" as open-source mode; everything else is platform
-    const mode: Mem0Mode =
-      cfg.mode === "oss" || cfg.mode === "open-source" ? "open-source" : "platform";
-
-    // Platform mode requires apiKey
-    if (mode === "platform") {
-      if (typeof cfg.apiKey !== "string" || !cfg.apiKey) {
-        throw new Error(
-          "apiKey is required for platform mode (set mode: \"open-source\" for self-hosted)",
-        );
-      }
-    }
-
-    // Resolve env vars in oss config
-    let ossConfig: Mem0Config["oss"];
-    if (cfg.oss && typeof cfg.oss === "object" && !Array.isArray(cfg.oss)) {
-      ossConfig = resolveEnvVarsDeep(
-        cfg.oss as Record<string, unknown>,
-      ) as unknown as Mem0Config["oss"];
-    }
-
-    return {
-      mode,
-      apiKey:
-        typeof cfg.apiKey === "string" ? resolveEnvVars(cfg.apiKey) : undefined,
-      userId:
-        typeof cfg.userId === "string" && cfg.userId ? cfg.userId : "default",
-      orgId: typeof cfg.orgId === "string" ? cfg.orgId : undefined,
-      projectId: typeof cfg.projectId === "string" ? cfg.projectId : undefined,
-      autoCapture: cfg.autoCapture !== false,
-      autoRecall: cfg.autoRecall !== false,
-      customInstructions:
-        typeof cfg.customInstructions === "string"
-          ? cfg.customInstructions
-          : DEFAULT_CUSTOM_INSTRUCTIONS,
-      customCategories:
-        cfg.customCategories &&
-          typeof cfg.customCategories === "object" &&
-          !Array.isArray(cfg.customCategories)
-          ? (cfg.customCategories as Record<string, string>)
-          : DEFAULT_CUSTOM_CATEGORIES,
-      customPrompt:
-        typeof cfg.customPrompt === "string"
-          ? cfg.customPrompt
-          : DEFAULT_CUSTOM_INSTRUCTIONS,
-      enableGraph: cfg.enableGraph === true,
-      searchThreshold:
-        typeof cfg.searchThreshold === "number" ? cfg.searchThreshold : 0.5,
-      topK: typeof cfg.topK === "number" ? cfg.topK : 5,
-      oss: ossConfig,
-      agentMemory: (() => {
-        if (!cfg.agentMemory || typeof cfg.agentMemory !== "object" || Array.isArray(cfg.agentMemory)) return undefined;
-        const am: Record<string, { capture: string; recall: string[] }> = {};
-        for (const [key, val] of Object.entries(cfg.agentMemory as Record<string, unknown>)) {
-          if (!val || typeof val !== "object" || Array.isArray(val)) continue;
-          const v = val as Record<string, unknown>;
-          if (typeof v.capture !== "string" || !Array.isArray(v.recall)) {
-            console.warn(`openclaw-mem0: agentMemory[${key}] has invalid capture/recall — SKIPPING (fail-closed). capture must be string, recall must be array.`);
-            continue;
-          }
-          const recall = v.recall.filter((r: unknown): r is string => typeof r === "string");
-          if (recall.length === 0) {
-            console.warn(`openclaw-mem0: agentMemory[${key}].recall is empty after filtering — SKIPPING (fail-closed).`);
-            continue;
-          }
-          am[key] = { capture: v.capture, recall };
-        }
-        return Object.keys(am).length > 0 ? am : undefined;
-      })(),
-    };
-  },
-};
-
-// ============================================================================
-// Provider Factory
-// ============================================================================
-
-export function createProvider(
-  cfg: Mem0Config,
-  api: OpenClawPluginApi,
-): Mem0Provider {
-  if (cfg.mode === "open-source") {
-    return new OSSProvider(cfg.oss, cfg.customPrompt, (p) =>
-      api.resolvePath(p),
-    );
-  }
-
-  return new PlatformProvider(cfg.apiKey!, cfg.orgId, cfg.projectId);
-}
+export { extractAgentId, effectiveUserId, agentUserId, resolveUserId, isNonInteractiveTrigger, isSubagentSession } from "./isolation.ts";
+export {
+  isNoiseMessage,
+  isGenericAssistantMessage,
+  stripNoiseFromContent,
+  filterMessagesForExtraction,
+} from "./filtering.ts";
+export { mem0ConfigSchema } from "./config.ts";
+export { createProvider } from "./providers.ts";
 
 // ============================================================================
 // Helpers
@@ -664,7 +68,6 @@ function categoriesToArray(
 ): Array<Record<string, string>> {
   return Object.entries(cats).map(([key, value]) => ({ [key]: value }));
 }
-
 
 // ============================================================================
 // Plugin Definition
@@ -682,16 +85,15 @@ const memoryPlugin = {
     const cfg = mem0ConfigSchema.parse(api.pluginConfig);
     const provider = createProvider(cfg, api);
 
-    // Track current session ID for tool-level session scoping
+    // Track current session ID for tool-level session scoping.
+    // NOTE: This is shared mutable state — tools don't receive ctx, so they
+    // read this as a best-effort fallback. Hooks should use ctx.sessionKey
+    // directly and avoid relying on this variable.
     let currentSessionId: string | undefined;
     let currentAgentId: string | undefined;
 
-    api.logger.info(
-      `openclaw-mem0: registered (mode: ${cfg.mode}, user: ${cfg.userId}, graph: ${cfg.enableGraph}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
-    );
-
     // ========================================================================
-    // Multi-pool helpers
+    // Multi-pool helpers (agentMemory-based routing)
     // ========================================================================
 
     function extractSessionInfo(sessionKey: string | undefined): {
@@ -703,47 +105,60 @@ const memoryPlugin = {
       if (!sessionKey) return {};
       const parts = sessionKey.split(":");
       // Pattern: agent:<agentId>:<channel>:<type>:<id>
-      const agentId = parts.length >= 2 && parts[0] === "agent" ? parts[1] : undefined;
+      const agId = parts.length >= 2 && parts[0] === "agent" ? parts[1] : undefined;
       const channel = parts.length >= 3 ? parts[2] : undefined;
       if (channel === "cron") {
-        // Cron sessions: 4th segment is the job UUID, not a conversation type
-        return { agentId, channel, conversationType: "cron", chatId: parts.length >= 4 ? parts.slice(3).join(":") : undefined };
+        return { agentId: agId, channel, conversationType: "cron", chatId: parts.length >= 4 ? parts.slice(3).join(":") : undefined };
       }
       const conversationType = parts.length >= 4 ? parts[3] : undefined;
       const chatId = parts.length >= 5 ? parts.slice(4).join(":") : undefined;
-      return { agentId, channel, conversationType, chatId };
+      return { agentId: agId, channel, conversationType, chatId };
     }
 
     function getCapturePool(agentId: string | undefined): string | undefined {
+      if (!cfg.agentMemory) return cfg.userId;
       // Fail-closed: deny capture if agent unknown and multi-pool active
-      if (!agentId && cfg.agentMemory) return undefined;
+      if (!agentId) return undefined;
       const key = agentId ?? "main";
       // Fail-closed: deny capture if agent defined but not in pool map
-      if (cfg.agentMemory && !cfg.agentMemory[key]) return undefined;
-      return cfg.agentMemory?.[key]?.capture ?? cfg.userId;
+      if (!cfg.agentMemory[key]) return undefined;
+      return cfg.agentMemory[key].capture;
     }
 
     function getRecallPools(agentId: string | undefined): string[] {
+      if (!cfg.agentMemory) return [cfg.userId];
       // Fail-closed: deny all recall if agent unknown and multi-pool active
-      if (!agentId && cfg.agentMemory) return [];
+      if (!agentId) return [];
       const key = agentId ?? "main";
       // Fail-closed: deny recall if agent defined but not in pool map
-      if (cfg.agentMemory && !cfg.agentMemory[key]) return [];
-      return cfg.agentMemory?.[key]?.recall ?? [cfg.userId];
+      if (!cfg.agentMemory[key]) return [];
+      return cfg.agentMemory[key].recall;
     }
 
     function isPoolAllowed(pool: string, agentId: string | undefined): boolean {
       if (!cfg.agentMemory) return true; // no multi-pool config, allow all
-      // Deny if agent identity unknown
       if (!agentId) return false;
       const allowed = getRecallPools(agentId);
       return allowed.includes(pool);
     }
 
+    // ========================================================================
+    // Per-agent isolation helpers (thin wrappers around exported functions)
+    // ========================================================================
+    const _effectiveUserId = (sessionKey?: string) =>
+      effectiveUserId(cfg.userId, sessionKey);
+    const _agentUserId = (id: string) => agentUserId(cfg.userId, id);
+    const _resolveUserId = (opts: { agentId?: string; userId?: string }) =>
+      resolveUserId(cfg.userId, opts, currentSessionId);
+
+    api.logger.info(
+      `openclaw-mem0: registered (mode: ${cfg.mode}, user: ${cfg.userId}, graph: ${cfg.enableGraph}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
+    );
+
     // Helper: build add options
-    function buildAddOptions(userIdOverride?: string, runId?: string, metadata?: Record<string, unknown>): AddOptions {
+    function buildAddOptions(userIdOverride?: string, runId?: string, sessionKey?: string, metadata?: Record<string, unknown>): AddOptions {
       const opts: AddOptions = {
-        user_id: userIdOverride || cfg.userId,
+        user_id: userIdOverride || _effectiveUserId(sessionKey),
         source: "OPENCLAW",
       };
       if (runId) opts.run_id = runId;
@@ -762,9 +177,10 @@ const memoryPlugin = {
       userIdOverride?: string,
       limit?: number,
       runId?: string,
+      sessionKey?: string,
     ): SearchOptions {
       const opts: SearchOptions = {
-        user_id: userIdOverride || cfg.userId,
+        user_id: userIdOverride || _effectiveUserId(sessionKey),
         top_k: limit ?? cfg.topK,
         limit: limit ?? cfg.topK,
         threshold: cfg.searchThreshold,
@@ -780,64 +196,149 @@ const memoryPlugin = {
     // Tools
     // ========================================================================
 
-    api.registerTool(
-      {
-        name: "memory_search",
-        label: "Memory Search",
-        description:
-          "Search through long-term memories stored in Mem0. Use when you need context about user preferences, past decisions, or previously discussed topics.",
-        parameters: Type.Object({
-          query: Type.String({ description: "Search query" }),
-          limit: Type.Optional(
-            Type.Number({
-              description: `Max results (default: ${cfg.topK})`,
-            }),
-          ),
-          userId: Type.Optional(
-            Type.String({
-              description:
-                "User ID to scope search (default: configured userId)",
-            }),
-          ),
-          scope: Type.Optional(
-            Type.Union([
-              Type.Literal("session"),
-              Type.Literal("long-term"),
-              Type.Literal("all"),
-            ], {
-              description:
-                'Memory scope: "session" (current session only), "long-term" (user-scoped only), or "all" (both). Default: "all"',
-            }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
-          const { query, limit, userId, scope = "all" } = params as {
-            query: string;
-            limit?: number;
-            userId?: string;
-            scope?: "session" | "long-term" | "all";
-          };
+    registerTools(api, provider, cfg, _resolveUserId, _effectiveUserId, _agentUserId, buildAddOptions, buildSearchOptions, () => currentSessionId, () => currentAgentId, { getCapturePool, getRecallPools, isPoolAllowed, extractSessionInfo });
 
-          try {
-            let results: MemoryItem[] = [];
-            // B7 FIX: Snapshot agentId before any await
-            const agentId = currentAgentId;
+    // ========================================================================
+    // CLI Commands
+    // ========================================================================
 
-            // B2 FIX: Validate userId against pool boundaries
-            if (userId && !isPoolAllowed(userId, agentId)) {
-              return {
-                content: [
-                  { type: "text", text: "Access denied: pool not in recall list" },
-                ],
-                details: { error: "pool_boundary" },
-              };
-            }
+    registerCli(api, provider, cfg, _effectiveUserId, _agentUserId, buildSearchOptions, () => currentSessionId);
 
+    // ========================================================================
+    // Lifecycle Hooks
+    // ========================================================================
+
+    registerHooks(api, provider, cfg, _effectiveUserId, buildAddOptions, buildSearchOptions, {
+      setCurrentSessionId: (id: string) => { currentSessionId = id; },
+      setCurrentAgentId: (id: string | undefined) => { currentAgentId = id; },
+      getCurrentAgentId: () => currentAgentId,
+    }, { getCapturePool, getRecallPools, extractSessionInfo });
+
+    // B7 FIX: Refresh currentAgentId right before each tool executes.
+    // Fires synchronously before execute(), closing the race window.
+    api.on("before_tool_call", async (_event, ctx) => {
+      const hookAgentId = (ctx as any)?.agentId;
+      if (hookAgentId) currentAgentId = hookAgentId;
+    });
+
+    // ========================================================================
+    // Service
+    // ========================================================================
+
+    api.registerService({
+      id: "openclaw-mem0",
+      start: () => {
+        api.logger.info(
+          `openclaw-mem0: initialized (mode: ${cfg.mode}, user: ${cfg.userId}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
+        );
+      },
+      stop: () => {
+        api.logger.info("openclaw-mem0: stopped");
+      },
+    });
+  },
+};
+
+// ============================================================================
+// Multi-pool helpers type
+// ============================================================================
+
+interface PoolHelpers {
+  getCapturePool: (agentId: string | undefined) => string | undefined;
+  getRecallPools: (agentId: string | undefined) => string[];
+  isPoolAllowed: (pool: string, agentId: string | undefined) => boolean;
+  extractSessionInfo: (sessionKey: string | undefined) => {
+    agentId?: string;
+    channel?: string;
+    conversationType?: string;
+    chatId?: string;
+  };
+}
+
+// ============================================================================
+// Tool Registration
+// ============================================================================
+
+function registerTools(
+  api: OpenClawPluginApi,
+  provider: Mem0Provider,
+  cfg: Mem0Config,
+  _resolveUserId: (opts: { agentId?: string; userId?: string }) => string,
+  _effectiveUserId: (sessionKey?: string) => string,
+  _agentUserId: (id: string) => string,
+  buildAddOptions: (userIdOverride?: string, runId?: string, sessionKey?: string, metadata?: Record<string, unknown>) => AddOptions,
+  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions,
+  getCurrentSessionId: () => string | undefined,
+  getCurrentAgentId: () => string | undefined,
+  pool: PoolHelpers,
+) {
+  api.registerTool(
+    {
+      name: "memory_search",
+      label: "Memory Search",
+      description:
+        "Search through long-term memories stored in Mem0. Use when you need context about user preferences, past decisions, or previously discussed topics.",
+      parameters: Type.Object({
+        query: Type.String({ description: "Search query" }),
+        limit: Type.Optional(
+          Type.Number({
+            description: `Max results (default: ${cfg.topK})`,
+          }),
+        ),
+        userId: Type.Optional(
+          Type.String({
+            description:
+              "User ID to scope search (default: configured userId)",
+          }),
+        ),
+        agentId: Type.Optional(
+          Type.String({
+            description:
+              "Agent ID to search memories for a specific agent (e.g. \"researcher\"). Overrides userId.",
+          }),
+        ),
+        scope: Type.Optional(
+          Type.Union([
+            Type.Literal("session"),
+            Type.Literal("long-term"),
+            Type.Literal("all"),
+          ], {
+            description:
+              'Memory scope: "session" (current session only), "long-term" (user-scoped only), or "all" (both). Default: "all"',
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const { query, limit, userId, agentId: paramAgentId, scope = "all" } = params as {
+          query: string;
+          limit?: number;
+          userId?: string;
+          agentId?: string;
+          scope?: "session" | "long-term" | "all";
+        };
+
+        try {
+          let results: MemoryItem[] = [];
+          // B7 FIX: Snapshot agentId before any await
+          const agentId = paramAgentId ?? getCurrentAgentId();
+          const currentSessionId = getCurrentSessionId();
+
+          // Pool boundary check when agentMemory is configured
+          if (userId && !pool.isPoolAllowed(userId, agentId)) {
+            return {
+              content: [
+                { type: "text", text: "Access denied: pool not in recall list" },
+              ],
+              details: { error: "pool_boundary" },
+            };
+          }
+
+          if (cfg.agentMemory) {
+            // Multi-pool routing
             if (scope === "session") {
               if (currentSessionId) {
-                const pool = userId || getCapturePool(agentId);
-                // H1 FIX: Deny if pool unknown (agentId resolution failed)
-                if (!pool) {
+                const capturePool = userId || pool.getCapturePool(agentId);
+                if (!capturePool) {
                   return {
                     content: [
                       { type: "text", text: "Access denied: agent identity unknown" },
@@ -847,47 +348,32 @@ const memoryPlugin = {
                 }
                 results = await provider.search(
                   query,
-                  buildSearchOptions(pool, limit, currentSessionId),
+                  buildSearchOptions(capturePool, limit, currentSessionId),
                 );
               }
             } else if (scope === "long-term") {
               if (userId) {
-                // Explicit userId override (already validated above)
-                results = await provider.search(
-                  query,
-                  buildSearchOptions(userId, limit),
-                );
+                results = await provider.search(query, buildSearchOptions(userId, limit));
               } else {
-                // Multi-pool: search all recall pools
-                const pools = getRecallPools(agentId);
-                for (const pool of pools) {
-                  const poolResults = await provider.search(
-                    query,
-                    buildSearchOptions(pool, limit),
-                  );
+                const pools = pool.getRecallPools(agentId);
+                for (const p of pools) {
+                  const poolResults = await provider.search(query, buildSearchOptions(p, limit));
                   results.push(...poolResults);
                 }
               }
             } else {
-              // "all" - search all recall pools + session
+              // "all" — search all recall pools + session
               if (userId) {
-                results = await provider.search(
-                  query,
-                  buildSearchOptions(userId, limit),
-                );
+                results = await provider.search(query, buildSearchOptions(userId, limit));
               } else {
-                const pools = getRecallPools(agentId);
-                for (const pool of pools) {
-                  const poolResults = await provider.search(
-                    query,
-                    buildSearchOptions(pool, limit),
-                  );
+                const pools = pool.getRecallPools(agentId);
+                for (const p of pools) {
+                  const poolResults = await provider.search(query, buildSearchOptions(p, limit));
                   results.push(...poolResults);
                 }
               }
               if (currentSessionId) {
-                const capturePool = userId || getCapturePool(agentId);
-                // H1 FIX: Skip session search if pool unknown
+                const capturePool = userId || pool.getCapturePool(agentId);
                 if (capturePool) {
                   const sessionResults = await provider.search(
                     query,
@@ -909,8 +395,8 @@ const memoryPlugin = {
             results = results.slice(0, limit ?? cfg.topK);
 
             // Recall telemetry (explicit search)
-            const searchSessionInfo = extractSessionInfo(currentSessionId);
-            const searchPools = userId ? [userId] : getRecallPools(agentId);
+            const searchSessionInfo = pool.extractSessionInfo(currentSessionId);
+            const searchPools = userId ? [userId] : pool.getRecallPools(agentId);
             logRecallEvent({
               agent: agentId ?? "main",
               ctx: mapCtx(searchSessionInfo.conversationType),
@@ -921,270 +407,323 @@ const memoryPlugin = {
               threshold: cfg.searchThreshold,
               resolvePath: (p) => api.resolvePath(p),
             });
+          } else {
+            // Standard routing (no multi-pool)
+            const uid = _resolveUserId({ agentId: paramAgentId, userId });
 
-            if (!results || results.length === 0) {
-              return {
-                content: [
-                  { type: "text", text: "No relevant memories found." },
-                ],
-                details: { count: 0 },
-              };
+            if (scope === "session") {
+              if (currentSessionId) {
+                results = await provider.search(
+                  query,
+                  buildSearchOptions(uid, limit, currentSessionId),
+                );
+              }
+            } else if (scope === "long-term") {
+              results = await provider.search(
+                query,
+                buildSearchOptions(uid, limit),
+              );
+            } else {
+              // "all" — search both scopes and combine
+              const longTermResults = await provider.search(
+                query,
+                buildSearchOptions(uid, limit),
+              );
+              let sessionResults: MemoryItem[] = [];
+              if (currentSessionId) {
+                sessionResults = await provider.search(
+                  query,
+                  buildSearchOptions(uid, limit, currentSessionId),
+                );
+              }
+              // Deduplicate by ID, preferring long-term
+              const seen = new Set(longTermResults.map((r) => r.id));
+              results = [
+                ...longTermResults,
+                ...sessionResults.filter((r) => !seen.has(r.id)),
+              ];
             }
+          }
 
-            const text = results
-              .map(
-                (r, i) =>
-                  `${i + 1}. ${r.memory} (score: ${((r.score ?? 0) * 100).toFixed(0)}%, id: ${r.id})`,
-              )
-              .join("\n");
-
-            const sanitized = results.map((r) => ({
-              id: r.id,
-              memory: r.memory,
-              score: r.score,
-              categories: r.categories,
-              created_at: r.created_at,
-            }));
-
+          if (!results || results.length === 0) {
             return {
               content: [
-                {
-                  type: "text",
-                  text: `Found ${results.length} memories:\n\n${text}`,
-                },
+                { type: "text", text: "No relevant memories found." },
               ],
-              details: { count: results.length, memories: sanitized },
-            };
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Memory search failed: ${String(err)}`,
-                },
-              ],
-              details: { error: String(err) },
+              details: { count: 0 },
             };
           }
-        },
-      },
-      { name: "memory_search" },
-    );
 
-    api.registerTool(
-      {
-        name: "memory_store",
-        label: "Memory Store",
-        description:
-          "Save important information in long-term memory via Mem0. Use for preferences, facts, decisions, and anything worth remembering.",
-        parameters: Type.Object({
-          text: Type.String({ description: "Information to remember" }),
-          userId: Type.Optional(
-            Type.String({
-              description: "User ID to scope this memory",
-            }),
-          ),
-          metadata: Type.Optional(
-            Type.Record(Type.String(), Type.Unknown(), {
-              description: "Optional metadata to attach to this memory",
-            }),
-          ),
-          longTerm: Type.Optional(
-            Type.Boolean({
-              description:
-                "Store as long-term (user-scoped) memory. Default: true. Set to false for session-scoped memory.",
-            }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
-          const { text, userId, longTerm = true } = params as {
-            text: string;
-            userId?: string;
-            metadata?: Record<string, unknown>;
-            longTerm?: boolean;
+          const text = results
+            .map(
+              (r, i) =>
+                `${i + 1}. ${r.memory} (score: ${((r.score ?? 0) * 100).toFixed(0)}%, id: ${r.id})`,
+            )
+            .join("\n");
+
+          const sanitized = results.map((r) => ({
+            id: r.id,
+            memory: r.memory,
+            score: r.score,
+            categories: r.categories,
+            created_at: r.created_at,
+          }));
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Found ${results.length} memories:\n\n${text}`,
+              },
+            ],
+            details: { count: results.length, memories: sanitized },
           };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Memory search failed: ${String(err)}`,
+              },
+            ],
+            details: { error: String(err) },
+          };
+        }
+      },
+    },
+    { name: "memory_search" },
+  );
 
-          try {
-            // B7 FIX: Snapshot agentId before any await
-            const agentId = currentAgentId;
-            const sessionInfo = extractSessionInfo(currentSessionId);
+  api.registerTool(
+    {
+      name: "memory_store",
+      label: "Memory Store",
+      description:
+        "Save important information in long-term memory via Mem0. Use for preferences, facts, decisions, and anything worth remembering.",
+      parameters: Type.Object({
+        text: Type.String({ description: "Information to remember" }),
+        userId: Type.Optional(
+          Type.String({
+            description: "User ID to scope this memory",
+          }),
+        ),
+        agentId: Type.Optional(
+          Type.String({
+            description:
+              "Agent ID to store memory under a specific agent's namespace (e.g. \"researcher\"). Overrides userId.",
+          }),
+        ),
+        metadata: Type.Optional(
+          Type.Record(Type.String(), Type.Unknown(), {
+            description: "Optional metadata to attach to this memory",
+          }),
+        ),
+        longTerm: Type.Optional(
+          Type.Boolean({
+            description:
+              "Store as long-term (user-scoped) memory. Default: true. Set to false for session-scoped memory.",
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const { text, userId, agentId: paramAgentId, longTerm = true } = params as {
+          text: string;
+          userId?: string;
+          agentId?: string;
+          metadata?: Record<string, unknown>;
+          longTerm?: boolean;
+        };
 
-            // B6 FIX: Validate userId against pool boundaries for writes
-            if (userId && !isPoolAllowed(userId, agentId)) {
-              return {
-                content: [
-                  { type: "text", text: "Access denied: pool not in recall list" },
-                ],
-                details: { error: "pool_boundary" },
-              };
-            }
+        try {
+          const agentId = paramAgentId ?? getCurrentAgentId();
+          const currentSessionId = getCurrentSessionId();
+          let uid: string;
 
-            const capturePool = userId || getCapturePool(agentId);
-            // B8 FIX: Guard against undefined capturePool (agent identity unknown)
+          if (cfg.agentMemory) {
+            const capturePool = userId || pool.getCapturePool(agentId);
             if (!capturePool) {
               return {
                 content: [
-                  { type: "text", text: "Cannot store: agent identity unknown" },
+                  { type: "text", text: "Access denied: agent identity unknown" },
                 ],
                 details: { error: "unknown_agent" },
               };
             }
-            const runId = !longTerm && currentSessionId ? currentSessionId : undefined;
-            const provenance: Record<string, unknown> = {
-              is_private: sessionInfo.conversationType !== "group",
-              source_channel: sessionInfo.channel ?? "unknown",
-              conversation_type: sessionInfo.conversationType ?? "unknown",
-              chat_id: sessionInfo.chatId,
-              agent_id: agentId ?? "main",
-            };
-            const result = await provider.add(
-              [{ role: "user", content: text }],
-              buildAddOptions(capturePool, runId, provenance),
+            uid = capturePool;
+          } else {
+            uid = _resolveUserId({ agentId: paramAgentId, userId });
+          }
+
+          const runId = !longTerm && currentSessionId ? currentSessionId : undefined;
+
+          // Pre-check for near-duplicates so the extraction model has
+          // context about existing memories and can UPDATE rather than ADD
+          const preview = text.slice(0, 200);
+          const dedupOpts = buildSearchOptions(uid, 3);
+          dedupOpts.threshold = 0.85;
+          const existing = await provider.search(preview, dedupOpts);
+          if (existing.length > 0) {
+            api.logger.info(
+              `openclaw-mem0: found ${existing.length} similar existing memories — mem0 may update instead of add`,
             );
+          }
 
-            const added =
-              result.results?.filter((r) => r.event === "ADD") ?? [];
-            const updated =
-              result.results?.filter((r) => r.event === "UPDATE") ?? [];
+          const result = await provider.add(
+            [{ role: "user", content: text }],
+            buildAddOptions(uid, runId, currentSessionId),
+          );
 
-            const summary = [];
-            if (added.length > 0)
-              summary.push(
-                `${added.length} new memor${added.length === 1 ? "y" : "ies"} added`,
-              );
-            if (updated.length > 0)
-              summary.push(
-                `${updated.length} memor${updated.length === 1 ? "y" : "ies"} updated`,
-              );
-            if (summary.length === 0)
-              summary.push("No new memories extracted");
+          const added =
+            result.results?.filter((r) => r.event === "ADD") ?? [];
+          const updated =
+            result.results?.filter((r) => r.event === "UPDATE") ?? [];
 
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Stored: ${summary.join(", ")}. ${result.results?.map((r) => `[${r.event}] ${r.memory}`).join("; ") ?? ""}`,
-                },
-              ],
-              details: {
-                action: "stored",
-                results: result.results,
+          const summary = [];
+          if (added.length > 0)
+            summary.push(
+              `${added.length} new memor${added.length === 1 ? "y" : "ies"} added`,
+            );
+          if (updated.length > 0)
+            summary.push(
+              `${updated.length} memor${updated.length === 1 ? "y" : "ies"} updated`,
+            );
+          if (summary.length === 0)
+            summary.push("No new memories extracted");
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Stored: ${summary.join(", ")}. ${result.results?.map((r) => `[${r.event}] ${r.memory}`).join("; ") ?? ""}`,
               },
-            };
-          } catch (err) {
+            ],
+            details: {
+              action: "stored",
+              results: result.results,
+            },
+          };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Memory store failed: ${String(err)}`,
+              },
+            ],
+            details: { error: String(err) },
+          };
+        }
+      },
+    },
+    { name: "memory_store" },
+  );
+
+  api.registerTool(
+    {
+      name: "memory_get",
+      label: "Memory Get",
+      description: "Retrieve a specific memory by its ID from Mem0.",
+      parameters: Type.Object({
+        memoryId: Type.String({ description: "The memory ID to retrieve" }),
+      }),
+      async execute(_toolCallId, params) {
+        const { memoryId } = params as { memoryId: string };
+
+        try {
+          // B7 FIX: Snapshot agentId before any await
+          const agentId = getCurrentAgentId();
+          const memory = await provider.get(memoryId);
+
+          // Pool boundary check: deny if user_id missing OR not in allowed pools
+          if (cfg.agentMemory && (!memory.user_id || !pool.isPoolAllowed(memory.user_id, agentId))) {
             return {
               content: [
-                {
-                  type: "text",
-                  text: `Memory store failed: ${String(err)}`,
-                },
+                { type: "text", text: "Access denied: memory not in recall pools" },
               ],
-              details: { error: String(err) },
+              details: { error: "pool_boundary" },
             };
           }
-        },
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Memory ${memory.id}:\n${memory.memory}\n\nCreated: ${memory.created_at ?? "unknown"}\nUpdated: ${memory.updated_at ?? "unknown"}`,
+              },
+            ],
+            details: { memory },
+          };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Memory get failed: ${String(err)}`,
+              },
+            ],
+            details: { error: String(err) },
+          };
+        }
       },
-      { name: "memory_store" },
-    );
+    },
+    { name: "memory_get" },
+  );
 
-    api.registerTool(
-      {
-        name: "memory_get",
-        label: "Memory Get",
-        description: "Retrieve a specific memory by its ID from Mem0.",
-        parameters: Type.Object({
-          memoryId: Type.String({ description: "The memory ID to retrieve" }),
-        }),
-        async execute(_toolCallId, params) {
-          const { memoryId } = params as { memoryId: string };
+  api.registerTool(
+    {
+      name: "memory_list",
+      label: "Memory List",
+      description:
+        "List all stored memories for a user or agent. Use this when you want to see everything that's been remembered, rather than searching for something specific.",
+      parameters: Type.Object({
+        userId: Type.Optional(
+          Type.String({
+            description:
+              "User ID to list memories for (default: configured userId)",
+          }),
+        ),
+        agentId: Type.Optional(
+          Type.String({
+            description:
+              "Agent ID to list memories for a specific agent (e.g. \"researcher\"). Overrides userId.",
+          }),
+        ),
+        scope: Type.Optional(
+          Type.Union([
+            Type.Literal("session"),
+            Type.Literal("long-term"),
+            Type.Literal("all"),
+          ], {
+            description:
+              'Memory scope: "session" (current session only), "long-term" (user-scoped only), or "all" (both). Default: "all"',
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const { userId, agentId: paramAgentId, scope = "all" } = params as { userId?: string; agentId?: string; scope?: "session" | "long-term" | "all" };
 
-          try {
-            // B7 FIX: Snapshot agentId before any await
-            const agentId = currentAgentId;
-            const memory = await provider.get(memoryId);
+        try {
+          let memories: MemoryItem[] = [];
+          // B7 FIX: Snapshot agentId before any await
+          const agentId = paramAgentId ?? getCurrentAgentId();
+          const currentSessionId = getCurrentSessionId();
 
-            // B3+W1 FIX: Fail-closed — deny if user_id missing OR not in allowed pools
-            if (!memory.user_id || !isPoolAllowed(memory.user_id, agentId)) {
-              return {
-                content: [
-                  { type: "text", text: "Access denied: memory not in recall pools" },
-                ],
-                details: { error: "pool_boundary" },
-              };
-            }
-
+          // Pool boundary check
+          if (userId && !pool.isPoolAllowed(userId, agentId)) {
             return {
               content: [
-                {
-                  type: "text",
-                  text: `Memory ${memory.id}:\n${memory.memory}\n\nCreated: ${memory.created_at ?? "unknown"}\nUpdated: ${memory.updated_at ?? "unknown"}`,
-                },
+                { type: "text", text: "Access denied: pool not in recall list" },
               ],
-              details: { memory },
-            };
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Memory get failed: ${String(err)}`,
-                },
-              ],
-              details: { error: String(err) },
+              details: { error: "pool_boundary" },
             };
           }
-        },
-      },
-      { name: "memory_get" },
-    );
 
-    api.registerTool(
-      {
-        name: "memory_list",
-        label: "Memory List",
-        description:
-          "List all stored memories for a user. Use this when you want to see everything that's been remembered, rather than searching for something specific.",
-        parameters: Type.Object({
-          userId: Type.Optional(
-            Type.String({
-              description:
-                "User ID to list memories for (default: configured userId)",
-            }),
-          ),
-          scope: Type.Optional(
-            Type.Union([
-              Type.Literal("session"),
-              Type.Literal("long-term"),
-              Type.Literal("all"),
-            ], {
-              description:
-                'Memory scope: "session" (current session only), "long-term" (user-scoped only), or "all" (both). Default: "all"',
-            }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
-          const { userId, scope = "all" } = params as { userId?: string; scope?: "session" | "long-term" | "all" };
-
-          try {
-            let memories: MemoryItem[] = [];
-            // B7 FIX: Snapshot agentId before any await
-            const agentId = currentAgentId;
-
-            // B2 FIX: Validate userId against pool boundaries
-            if (userId && !isPoolAllowed(userId, agentId)) {
-              return {
-                content: [
-                  { type: "text", text: "Access denied: pool not in recall list" },
-                ],
-                details: { error: "pool_boundary" },
-              };
-            }
-
+          if (cfg.agentMemory) {
+            // Multi-pool routing
             if (scope === "session") {
               if (currentSessionId) {
-                const pool = userId || getCapturePool(agentId);
-                // H1 FIX: Deny if pool unknown (agentId resolution failed)
-                if (!pool) {
+                const capturePool = userId || pool.getCapturePool(agentId);
+                if (!capturePool) {
                   return {
                     content: [
                       { type: "text", text: "Access denied: agent identity unknown" },
@@ -1193,7 +732,7 @@ const memoryPlugin = {
                   };
                 }
                 memories = await provider.getAll({
-                  user_id: pool,
+                  user_id: capturePool,
                   run_id: currentSessionId,
                   source: "OPENCLAW",
                 });
@@ -1202,26 +741,25 @@ const memoryPlugin = {
               if (userId) {
                 memories = await provider.getAll({ user_id: userId, source: "OPENCLAW" });
               } else {
-                const pools = getRecallPools(agentId);
-                for (const pool of pools) {
-                  const poolMemories = await provider.getAll({ user_id: pool, source: "OPENCLAW" });
+                const pools = pool.getRecallPools(agentId);
+                for (const p of pools) {
+                  const poolMemories = await provider.getAll({ user_id: p, source: "OPENCLAW" });
                   memories.push(...poolMemories);
                 }
               }
             } else {
-              // "all" - list from all recall pools + session
+              // "all" — list from all recall pools + session
               if (userId) {
                 memories = await provider.getAll({ user_id: userId, source: "OPENCLAW" });
               } else {
-                const pools = getRecallPools(agentId);
-                for (const pool of pools) {
-                  const poolMemories = await provider.getAll({ user_id: pool, source: "OPENCLAW" });
+                const pools = pool.getRecallPools(agentId);
+                for (const p of pools) {
+                  const poolMemories = await provider.getAll({ user_id: p, source: "OPENCLAW" });
                   memories.push(...poolMemories);
                 }
               }
               if (currentSessionId) {
-                const capturePool = userId || getCapturePool(agentId);
-                // H1 FIX: Skip session list if pool unknown
+                const capturePool = userId || pool.getCapturePool(agentId);
                 if (capturePool) {
                   const sessionMems = await provider.getAll({
                     user_id: capturePool,
@@ -1240,84 +778,123 @@ const memoryPlugin = {
               dedup.add(r.id);
               return true;
             });
+          } else {
+            // Standard routing (no multi-pool)
+            const uid = _resolveUserId({ agentId: paramAgentId, userId });
 
-            if (!memories || memories.length === 0) {
-              return {
-                content: [
-                  { type: "text", text: "No memories stored yet." },
-                ],
-                details: { count: 0 },
-              };
+            if (scope === "session") {
+              if (currentSessionId) {
+                memories = await provider.getAll({
+                  user_id: uid,
+                  run_id: currentSessionId,
+                  source: "OPENCLAW",
+                });
+              }
+            } else if (scope === "long-term") {
+              memories = await provider.getAll({ user_id: uid, source: "OPENCLAW" });
+            } else {
+              const longTerm = await provider.getAll({ user_id: uid, source: "OPENCLAW" });
+              let session: MemoryItem[] = [];
+              if (currentSessionId) {
+                session = await provider.getAll({
+                  user_id: uid,
+                  run_id: currentSessionId,
+                  source: "OPENCLAW",
+                });
+              }
+              const seen = new Set(longTerm.map((r) => r.id));
+              memories = [
+                ...longTerm,
+                ...session.filter((r) => !seen.has(r.id)),
+              ];
             }
+          }
 
-            const text = memories
-              .map(
-                (r, i) =>
-                  `${i + 1}. ${r.memory} (id: ${r.id})`,
-              )
-              .join("\n");
-
-            const sanitized = memories.map((r) => ({
-              id: r.id,
-              memory: r.memory,
-              categories: r.categories,
-              created_at: r.created_at,
-            }));
-
+          if (!memories || memories.length === 0) {
             return {
               content: [
-                {
-                  type: "text",
-                  text: `${memories.length} memories:\n\n${text}`,
-                },
+                { type: "text", text: "No memories stored yet." },
               ],
-              details: { count: memories.length, memories: sanitized },
-            };
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: `Memory list failed: ${String(err)}`,
-                },
-              ],
-              details: { error: String(err) },
+              details: { count: 0 },
             };
           }
-        },
-      },
-      { name: "memory_list" },
-    );
 
-    api.registerTool(
-      {
-        name: "memory_forget",
-        label: "Memory Forget",
-        description:
-          "Delete memories from Mem0. Provide a specific memoryId to delete directly, or a query to search and delete matching memories. GDPR-compliant.",
-        parameters: Type.Object({
-          query: Type.Optional(
-            Type.String({
-              description: "Search query to find memory to delete",
-            }),
-          ),
-          memoryId: Type.Optional(
-            Type.String({ description: "Specific memory ID to delete" }),
-          ),
-        }),
-        async execute(_toolCallId, params) {
-          const { query, memoryId } = params as {
-            query?: string;
-            memoryId?: string;
+          const text = memories
+            .map(
+              (r, i) =>
+                `${i + 1}. ${r.memory} (id: ${r.id})`,
+            )
+            .join("\n");
+
+          const sanitized = memories.map((r) => ({
+            id: r.id,
+            memory: r.memory,
+            categories: r.categories,
+            created_at: r.created_at,
+          }));
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${memories.length} memories:\n\n${text}`,
+              },
+            ],
+            details: { count: memories.length, memories: sanitized },
           };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Memory list failed: ${String(err)}`,
+              },
+            ],
+            details: { error: String(err) },
+          };
+        }
+      },
+    },
+    { name: "memory_list" },
+  );
 
-          try {
-            if (memoryId) {
-              // B4+W1 FIX: Fail-closed — deny if user_id missing OR not in allowed pools
-              // B7 FIX: Snapshot agentId before any await
-              const agentId = currentAgentId;
+  api.registerTool(
+    {
+      name: "memory_forget",
+      label: "Memory Forget",
+      description:
+        "Delete memories from Mem0. Provide a specific memoryId to delete directly, or a query to search and delete matching memories. Supports agent-scoped deletion. GDPR-compliant.",
+      parameters: Type.Object({
+        query: Type.Optional(
+          Type.String({
+            description: "Search query to find memory to delete",
+          }),
+        ),
+        memoryId: Type.Optional(
+          Type.String({ description: "Specific memory ID to delete" }),
+        ),
+        agentId: Type.Optional(
+          Type.String({
+            description:
+              "Agent ID to scope deletion to a specific agent's memories (e.g. \"researcher\").",
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const { query, memoryId, agentId: paramAgentId } = params as {
+          query?: string;
+          memoryId?: string;
+          agentId?: string;
+        };
+
+        try {
+          const agentId = paramAgentId ?? getCurrentAgentId();
+
+          if (memoryId) {
+            // Pool boundary check before delete
+            if (cfg.agentMemory) {
               const mem = await provider.get(memoryId);
-              if (!mem.user_id || !isPoolAllowed(mem.user_id, agentId)) {
+              if (!mem.user_id || !pool.isPoolAllowed(mem.user_id, agentId)) {
                 return {
                   content: [
                     { type: "text", text: "Access denied: memory not in recall pools" },
@@ -1325,25 +902,26 @@ const memoryPlugin = {
                   details: { error: "pool_boundary" },
                 };
               }
-              await provider.delete(memoryId);
-              return {
-                content: [
-                  { type: "text", text: `Memory ${memoryId} forgotten.` },
-                ],
-                details: { action: "deleted", id: memoryId },
-              };
             }
+            await provider.delete(memoryId);
+            return {
+              content: [
+                { type: "text", text: `Memory ${memoryId} forgotten.` },
+              ],
+              details: { action: "deleted", id: memoryId },
+            };
+          }
 
-            if (query) {
+          if (query) {
+            let results: MemoryItem[] = [];
+
+            if (cfg.agentMemory) {
               // Search across all recall pools for this agent
-              // B7 FIX: Snapshot agentId before any await
-              const agentId = currentAgentId;
-              const pools = getRecallPools(agentId);
-              let results: MemoryItem[] = [];
-              for (const pool of pools) {
+              const pools = pool.getRecallPools(agentId);
+              for (const p of pools) {
                 const poolResults = await provider.search(
                   query,
-                  buildSearchOptions(pool, 5),
+                  buildSearchOptions(p, 5),
                 );
                 results.push(...poolResults);
               }
@@ -1356,230 +934,284 @@ const memoryPlugin = {
               });
               results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
               results = results.slice(0, 5);
+            } else {
+              const uid = _resolveUserId({ agentId: paramAgentId });
+              results = await provider.search(
+                query,
+                buildSearchOptions(uid, 5),
+              );
+            }
 
-              if (!results || results.length === 0) {
+            if (!results || results.length === 0) {
+              return {
+                content: [
+                  { type: "text", text: "No matching memories found." },
+                ],
+                details: { found: 0 },
+              };
+            }
+
+            // If single high-confidence match, delete directly
+            if (
+              results.length === 1 ||
+              (results[0].score ?? 0) > 0.9
+            ) {
+              // Pool boundary defense-in-depth before delete
+              if (cfg.agentMemory && (!results[0].user_id || !pool.isPoolAllowed(results[0].user_id, agentId))) {
                 return {
                   content: [
-                    { type: "text", text: "No matching memories found." },
+                    { type: "text", text: "Access denied: memory not in recall pools" },
                   ],
-                  details: { found: 0 },
+                  details: { error: "pool_boundary" },
                 };
               }
-
-              // If single high-confidence match, delete directly
-              if (
-                results.length === 1 ||
-                (results[0].score ?? 0) > 0.9
-              ) {
-                // H3 FIX: Defense-in-depth — verify result's pool before delete
-                if (!results[0].user_id || !isPoolAllowed(results[0].user_id, agentId)) {
-                  return {
-                    content: [
-                      { type: "text", text: "Access denied: memory not in recall pools" },
-                    ],
-                    details: { error: "pool_boundary" },
-                  };
-                }
-                await provider.delete(results[0].id);
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: `Forgotten: "${results[0].memory}"`,
-                    },
-                  ],
-                  details: { action: "deleted", id: results[0].id },
-                };
-              }
-
-              const list = results
-                .map(
-                  (r) =>
-                    `- [${r.id}] ${r.memory.slice(0, 80)}${r.memory.length > 80 ? "..." : ""} (score: ${((r.score ?? 0) * 100).toFixed(0)}%)`,
-                )
-                .join("\n");
-
-              const candidates = results.map((r) => ({
-                id: r.id,
-                memory: r.memory,
-                score: r.score,
-              }));
-
+              await provider.delete(results[0].id);
               return {
                 content: [
                   {
                     type: "text",
-                    text: `Found ${results.length} candidates. Specify memoryId to delete:\n${list}`,
+                    text: `Forgotten: "${results[0].memory}"`,
                   },
                 ],
-                details: { action: "candidates", candidates },
+                details: { action: "deleted", id: results[0].id },
               };
             }
 
-            return {
-              content: [
-                { type: "text", text: "Provide a query or memoryId." },
-              ],
-              details: { error: "missing_param" },
-            };
-          } catch (err) {
+            const list = results
+              .map(
+                (r) =>
+                  `- [${r.id}] ${r.memory.slice(0, 80)}${r.memory.length > 80 ? "..." : ""} (score: ${((r.score ?? 0) * 100).toFixed(0)}%)`,
+              )
+              .join("\n");
+
+            const candidates = results.map((r) => ({
+              id: r.id,
+              memory: r.memory,
+              score: r.score,
+            }));
+
             return {
               content: [
                 {
                   type: "text",
-                  text: `Memory forget failed: ${String(err)}`,
+                  text: `Found ${results.length} candidates. Specify memoryId to delete:\n${list}`,
                 },
               ],
-              details: { error: String(err) },
+              details: { action: "candidates", candidates },
             };
           }
-        },
+
+          return {
+            content: [
+              { type: "text", text: "Provide a query or memoryId." },
+            ],
+            details: { error: "missing_param" },
+          };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Memory forget failed: ${String(err)}`,
+              },
+            ],
+            details: { error: String(err) },
+          };
+        }
       },
-      { name: "memory_forget" },
-    );
+    },
+    { name: "memory_forget" },
+  );
+}
 
-    // ========================================================================
-    // CLI Commands
-    // ========================================================================
+// ============================================================================
+// CLI Registration
+// ============================================================================
 
-    api.registerCli(
-      ({ program }) => {
-        const mem0 = program
-          .command("mem0")
-          .description("Mem0 memory plugin commands");
+function registerCli(
+  api: OpenClawPluginApi,
+  provider: Mem0Provider,
+  cfg: Mem0Config,
+  _effectiveUserId: (sessionKey?: string) => string,
+  _agentUserId: (id: string) => string,
+  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions,
+  getCurrentSessionId: () => string | undefined,
+) {
+  api.registerCli(
+    ({ program }) => {
+      const mem0 = program
+        .command("mem0")
+        .description("Mem0 memory plugin commands");
 
-        mem0
-          .command("search")
-          .description("Search memories in Mem0")
-          .argument("<query>", "Search query")
-          .option("--limit <n>", "Max results", String(cfg.topK))
-          .option("--scope <scope>", 'Memory scope: "session", "long-term", or "all"', "all")
-          .action(async (query: string, opts: { limit: string; scope: string }) => {
-            try {
-              const limit = parseInt(opts.limit, 10);
-              const scope = opts.scope as "session" | "long-term" | "all";
+      mem0
+        .command("search")
+        .description("Search memories in Mem0")
+        .argument("<query>", "Search query")
+        .option("--limit <n>", "Max results", String(cfg.topK))
+        .option("--scope <scope>", 'Memory scope: "session", "long-term", or "all"', "all")
+        .option("--agent <agentId>", "Search a specific agent's memory namespace")
+        .action(async (query: string, opts: { limit: string; scope: string; agent?: string }) => {
+          try {
+            const limit = parseInt(opts.limit, 10);
+            const scope = opts.scope as "session" | "long-term" | "all";
+            const currentSessionId = getCurrentSessionId();
+            const uid = opts.agent ? _agentUserId(opts.agent) : _effectiveUserId(currentSessionId);
 
-              let allResults: MemoryItem[] = [];
+            let allResults: MemoryItem[] = [];
 
-              if (scope === "session" || scope === "all") {
-                if (currentSessionId) {
-                  const sessionResults = await provider.search(
-                    query,
-                    buildSearchOptions(undefined, limit, currentSessionId),
-                  );
-                  if (sessionResults?.length) {
-                    allResults.push(...sessionResults.map((r) => ({ ...r, _scope: "session" as const })));
-                  }
-                } else if (scope === "session") {
-                  console.log("No active session ID available for session-scoped search.");
-                  return;
-                }
-              }
-
-              if (scope === "long-term" || scope === "all") {
-                const longTermResults = await provider.search(
+            if (scope === "session" || scope === "all") {
+              if (currentSessionId) {
+                const sessionResults = await provider.search(
                   query,
-                  buildSearchOptions(undefined, limit),
+                  buildSearchOptions(uid, limit, currentSessionId),
                 );
-                if (longTermResults?.length) {
-                  allResults.push(...longTermResults.map((r) => ({ ...r, _scope: "long-term" as const })));
+                if (sessionResults?.length) {
+                  allResults.push(...sessionResults.map((r) => ({ ...r, _scope: "session" as const })));
                 }
-              }
-
-              // Deduplicate by ID when searching "all"
-              if (scope === "all") {
-                const seen = new Set<string>();
-                allResults = allResults.filter((r) => {
-                  if (seen.has(r.id)) return false;
-                  seen.add(r.id);
-                  return true;
-                });
-              }
-
-              if (!allResults.length) {
-                console.log("No memories found.");
+              } else if (scope === "session") {
+                console.log("No active session ID available for session-scoped search.");
                 return;
               }
-
-              const output = allResults.map((r) => ({
-                id: r.id,
-                memory: r.memory,
-                score: r.score,
-                scope: (r as any)._scope,
-                categories: r.categories,
-                created_at: r.created_at,
-              }));
-              console.log(JSON.stringify(output, null, 2));
-            } catch (err) {
-              console.error(`Search failed: ${String(err)}`);
             }
-          });
 
-        mem0
-          .command("stats")
-          .description("Show memory statistics from Mem0")
-          .action(async () => {
-            try {
-              const memories = await provider.getAll({
-                user_id: cfg.userId,
-                source: "OPENCLAW",
+            if (scope === "long-term" || scope === "all") {
+              const longTermResults = await provider.search(
+                query,
+                buildSearchOptions(uid, limit),
+              );
+              if (longTermResults?.length) {
+                allResults.push(...longTermResults.map((r) => ({ ...r, _scope: "long-term" as const })));
+              }
+            }
+
+            // Deduplicate by ID when searching "all"
+            if (scope === "all") {
+              const seen = new Set<string>();
+              allResults = allResults.filter((r) => {
+                if (seen.has(r.id)) return false;
+                seen.add(r.id);
+                return true;
               });
-              console.log(`Mode: ${cfg.mode}`);
-              console.log(`User: ${cfg.userId}`);
-              console.log(
-                `Total memories: ${Array.isArray(memories) ? memories.length : "unknown"}`,
-              );
-              console.log(`Graph enabled: ${cfg.enableGraph}`);
-              console.log(
-                `Auto-recall: ${cfg.autoRecall}, Auto-capture: ${cfg.autoCapture}`,
-              );
-            } catch (err) {
-              console.error(`Stats failed: ${String(err)}`);
             }
-          });
-      },
-      { commands: ["mem0"] },
-    );
 
-    // ========================================================================
-    // Lifecycle Hooks
-    // ========================================================================
+            if (!allResults.length) {
+              console.log("No memories found.");
+              return;
+            }
 
-    // Auto-recall: inject relevant memories before agent starts
-    if (cfg.autoRecall) {
-      api.on("before_agent_start", async (event, ctx) => {
-        if (!event.prompt || event.prompt.length < 5) return;
+            const output = allResults.map((r) => ({
+              id: r.id,
+              memory: r.memory,
+              score: r.score,
+              scope: (r as any)._scope,
+              categories: r.categories,
+              created_at: r.created_at,
+            }));
+            console.log(JSON.stringify(output, null, 2));
+          } catch (err) {
+            console.error(`Search failed: ${String(err)}`);
+          }
+        });
 
-        // Track session ID and agent ID
-        const sessionId = (ctx as any)?.sessionKey ?? undefined;
-        if (sessionId) currentSessionId = sessionId;
-        // B7 FIX: Set module-level agentId for tool handlers to snapshot
-        currentAgentId = (ctx as any)?.agentId ?? extractSessionInfo(sessionId).agentId;
+      mem0
+        .command("stats")
+        .description("Show memory statistics from Mem0")
+        .option("--agent <agentId>", "Show stats for a specific agent")
+        .action(async (opts: { agent?: string }) => {
+          try {
+            const uid = opts.agent ? _agentUserId(opts.agent) : cfg.userId;
+            const memories = await provider.getAll({
+              user_id: uid,
+              source: "OPENCLAW",
+            });
+            console.log(`Mode: ${cfg.mode}`);
+            console.log(`User: ${uid}${opts.agent ? ` (agent: ${opts.agent})` : ""}`);
+            console.log(
+              `Total memories: ${Array.isArray(memories) ? memories.length : "unknown"}`,
+            );
+            console.log(`Graph enabled: ${cfg.enableGraph}`);
+            console.log(
+              `Auto-recall: ${cfg.autoRecall}, Auto-capture: ${cfg.autoCapture}`,
+            );
+          } catch (err) {
+            console.error(`Stats failed: ${String(err)}`);
+          }
+        });
+    },
+    { commands: ["mem0"] },
+  );
+}
 
-        try {
-          const agentId = currentAgentId;
-          const pools = getRecallPools(agentId);
+// ============================================================================
+// Lifecycle Hook Registration
+// ============================================================================
+
+function registerHooks(
+  api: OpenClawPluginApi,
+  provider: Mem0Provider,
+  cfg: Mem0Config,
+  _effectiveUserId: (sessionKey?: string) => string,
+  buildAddOptions: (userIdOverride?: string, runId?: string, sessionKey?: string, metadata?: Record<string, unknown>) => AddOptions,
+  buildSearchOptions: (userIdOverride?: string, limit?: number, runId?: string, sessionKey?: string) => SearchOptions,
+  session: {
+    setCurrentSessionId: (id: string) => void;
+    setCurrentAgentId: (id: string | undefined) => void;
+    getCurrentAgentId: () => string | undefined;
+  },
+  pool: Pick<PoolHelpers, "getCapturePool" | "getRecallPools" | "extractSessionInfo">,
+) {
+  // Auto-recall: inject relevant memories before agent starts
+  if (cfg.autoRecall) {
+    api.on("before_agent_start", async (event, ctx) => {
+      if (!event.prompt || event.prompt.length < 5) return;
+
+      // Skip non-interactive triggers (cron, heartbeat, automation)
+      const trigger = (ctx as any)?.trigger ?? undefined;
+      const sessionId = (ctx as any)?.sessionKey ?? undefined;
+      if (isNonInteractiveTrigger(trigger, sessionId)) {
+        api.logger.info("openclaw-mem0: skipping recall for non-interactive trigger");
+        return;
+      }
+
+      // Update shared state for tools (best-effort — tools don't have ctx)
+      if (sessionId) session.setCurrentSessionId(sessionId);
+      // B7 FIX: Set module-level agentId for tool handlers to snapshot
+      const ctxAgentId = (ctx as any)?.agentId ?? pool.extractSessionInfo(sessionId).agentId;
+      session.setCurrentAgentId(ctxAgentId);
+
+      // Subagents have ephemeral UUIDs — their namespace is always empty.
+      const isSubagent = isSubagentSession(sessionId);
+      const recallSessionKey = isSubagent ? undefined : sessionId;
+
+      try {
+        const agentId = ctxAgentId;
+
+        if (cfg.agentMemory) {
+          // Multi-pool recall
+          const pools = pool.getRecallPools(agentId);
           // B8 FIX: Fast-path if no pools (agent identity unknown)
           if (pools.length === 0) return;
           let allResults: MemoryItem[] = [];
 
           // Search each recall pool
-          for (const pool of pools) {
+          for (const p of pools) {
             const results = await provider.search(
               event.prompt,
-              buildSearchOptions(pool),
+              buildSearchOptions(p),
             );
             allResults.push(...results);
           }
 
           // Search session memories if we have a session ID
-          if (currentSessionId) {
-            const capturePool = getCapturePool(agentId);
-            const sessionResults = await provider.search(
-              event.prompt,
-              buildSearchOptions(capturePool, undefined, currentSessionId),
-            );
-            allResults.push(...sessionResults);
+          if (sessionId) {
+            const capturePool = pool.getCapturePool(agentId);
+            if (capturePool) {
+              const sessionResults = await provider.search(
+                event.prompt,
+                buildSearchOptions(capturePool, undefined, sessionId),
+              );
+              allResults.push(...sessionResults);
+            }
           }
 
           // Deduplicate by ID
@@ -1595,7 +1227,7 @@ const memoryPlugin = {
           allResults = allResults.slice(0, cfg.topK);
 
           // Recall guard: convention-based pool filtering
-          const sessionInfo = extractSessionInfo(sessionId);
+          const sessionInfo = pool.extractSessionInfo(sessionId);
           const ctxType = mapCtx(sessionInfo.conversationType);
           let filteredByGuard = 0;
           try {
@@ -1610,7 +1242,7 @@ const memoryPlugin = {
             api.logger.warn(`openclaw-mem0: recall guard failed, passing all results: ${String(guardErr)}`);
           }
 
-          // Recall telemetry (fires on every recall, including gaps)
+          // Recall telemetry
           logRecallEvent({
             agent: agentId ?? "main",
             ctx: ctxType,
@@ -1625,7 +1257,6 @@ const memoryPlugin = {
 
           if (allResults.length === 0) return;
 
-          // Build context with no pool labels
           const memoryContext = allResults
             .map(
               (r) =>
@@ -1640,96 +1271,258 @@ const memoryPlugin = {
           return {
             prependContext: `<relevant-memories>\nThe following memories may be relevant to this conversation:\n${memoryContext}\n</relevant-memories>`,
           };
-        } catch (err) {
-          api.logger.warn(`openclaw-mem0: recall failed: ${String(err)}`);
-        }
-      });
-    }
+        } else {
+          // Standard recall (no multi-pool) — upstream logic with dynamic thresholding
+          const recallTopK = Math.max((cfg.topK ?? 5) * 2, 10);
 
-    // B7 FIX: Refresh currentAgentId right before each tool executes.
-    // Fires synchronously before execute(), closing the race window.
-    api.on("before_tool_call", async (_event, ctx) => {
-      const hookAgentId = (ctx as any)?.agentId;
-      if (hookAgentId) currentAgentId = hookAgentId;
-    });
+          let longTermResults = await provider.search(
+            event.prompt,
+            buildSearchOptions(undefined, recallTopK, undefined, recallSessionKey),
+          );
 
-    // Auto-capture: store conversation context after agent ends
-    if (cfg.autoCapture) {
-      api.on("agent_end", async (event, ctx) => {
-        if (!event.success || !event.messages || event.messages.length === 0) {
-          return;
-        }
+          // Stricter threshold for auto-recall
+          const recallThreshold = Math.max(cfg.searchThreshold, 0.6);
+          longTermResults = longTermResults.filter(
+            (r) => (r.score ?? 0) >= recallThreshold,
+          );
 
-        // Track session ID
-        const sessionId = (ctx as any)?.sessionKey ?? undefined;
-        if (sessionId) currentSessionId = sessionId;
-
-        try {
-          // Extract messages, limiting to last 10
-          const recentMessages = event.messages.slice(-10);
-          const formattedMessages: Array<{
-            role: string;
-            content: string;
-          }> = [];
-
-          for (const msg of recentMessages) {
-            if (!msg || typeof msg !== "object") continue;
-            const msgObj = msg as Record<string, unknown>;
-
-            const role = msgObj.role;
-            if (role !== "user" && role !== "assistant") continue;
-
-            let textContent = "";
-            const content = msgObj.content;
-
-            if (typeof content === "string") {
-              textContent = content;
-            } else if (Array.isArray(content)) {
-              for (const block of content) {
-                if (
-                  block &&
-                  typeof block === "object" &&
-                  "text" in block &&
-                  typeof (block as Record<string, unknown>).text === "string"
-                ) {
-                  textContent +=
-                    (textContent ? "\n" : "") +
-                    ((block as Record<string, unknown>).text as string);
-                }
-              }
+          // Dynamic thresholding: drop below 50% of top score
+          if (longTermResults.length > 1) {
+            const topScore = longTermResults[0]?.score ?? 0;
+            if (topScore > 0) {
+              longTermResults = longTermResults.filter(
+                (r) => (r.score ?? 0) >= topScore * 0.5,
+              );
             }
-
-            if (!textContent) continue;
-            // Strip injected memory context, keep the actual user text
-            if (textContent.includes("<relevant-memories>")) {
-              textContent = textContent.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, "").trim();
-              if (!textContent) continue;
-            }
-
-            formattedMessages.push({
-              role: role as string,
-              content: textContent,
-            });
           }
 
-          if (formattedMessages.length === 0) return;
+          // Cold-start broadening for short prompts or new sessions
+          if (event.prompt.length < 100) {
+            const broadOpts = buildSearchOptions(undefined, 5, undefined, recallSessionKey);
+            broadOpts.threshold = 0.5;
+            const broadResults = await provider.search(
+              "recent decisions, preferences, active projects, and configuration",
+              broadOpts,
+            );
+            const existingIds = new Set(longTermResults.map((r) => r.id));
+            for (const r of broadResults) {
+              if (!existingIds.has(r.id)) {
+                longTermResults.push(r);
+              }
+            }
+          }
 
-          // LCM capture filter: restrict to user-role messages to prevent
-          // re-extraction of compacted summaries (Vigil Track B, Blocker 1)
-          const captureMessages = filterCaptureMessages(formattedMessages);
-          if (captureMessages.length === 0) return;
+          longTermResults = longTermResults.slice(0, cfg.topK);
 
-          // B5+B7 FIX: Use ctx.agentId, fall back to module-level currentAgentId
-          const agentId = (ctx as any)?.agentId ?? currentAgentId;
-          // H2 FIX: Snapshot sessionId from ctx (turn-scoped) to avoid racy module-level read
-          const safeSessionId = (ctx as any)?.sessionKey ?? currentSessionId;
-          const capturePool = getCapturePool(agentId);
+          // Session memories
+          let sessionResults: MemoryItem[] = [];
+          if (sessionId) {
+            sessionResults = await provider.search(
+              event.prompt,
+              buildSearchOptions(undefined, undefined, sessionId, recallSessionKey),
+            );
+            sessionResults = sessionResults.filter(
+              (r) => (r.score ?? 0) >= cfg.searchThreshold,
+            );
+          }
+
+          const longTermIds = new Set(longTermResults.map((r) => r.id));
+          const uniqueSessionResults = sessionResults.filter(
+            (r) => !longTermIds.has(r.id),
+          );
+
+          if (longTermResults.length === 0 && uniqueSessionResults.length === 0) return;
+
+          let memoryContext = "";
+          if (longTermResults.length > 0) {
+            memoryContext += longTermResults
+              .map(
+                (r) =>
+                  `- ${r.memory}${r.categories?.length ? ` [${r.categories.join(", ")}]` : ""}`,
+              )
+              .join("\n");
+          }
+          if (uniqueSessionResults.length > 0) {
+            if (memoryContext) memoryContext += "\n";
+            memoryContext += "\nSession memories:\n";
+            memoryContext += uniqueSessionResults
+              .map((r) => `- ${r.memory}`)
+              .join("\n");
+          }
+
+          const totalCount = longTermResults.length + uniqueSessionResults.length;
+          api.logger.info(
+            `openclaw-mem0: injecting ${totalCount} memories into context (${longTermResults.length} long-term, ${uniqueSessionResults.length} session)`,
+          );
+
+          const preamble = isSubagent
+            ? `The following are stored memories for user "${cfg.userId}". You are a subagent — use these memories for context but do not assume you are this user.`
+            : `The following are stored memories for user "${cfg.userId}". Use them to personalize your response:`;
+
+          return {
+            prependContext: `<relevant-memories>\n${preamble}\n${memoryContext}\n</relevant-memories>`,
+          };
+        }
+      } catch (err) {
+        api.logger.warn(`openclaw-mem0: recall failed: ${String(err)}`);
+      }
+    });
+  }
+
+  // Auto-capture: store conversation context after agent ends
+  if (cfg.autoCapture) {
+    api.on("agent_end", async (event, ctx) => {
+      if (!event.success || !event.messages || event.messages.length === 0) {
+        return;
+      }
+
+      // Skip non-interactive triggers (cron, heartbeat, automation)
+      const trigger = (ctx as any)?.trigger ?? undefined;
+      const sessionId = (ctx as any)?.sessionKey ?? undefined;
+      if (isNonInteractiveTrigger(trigger, sessionId)) {
+        api.logger.info("openclaw-mem0: skipping capture for non-interactive trigger");
+        return;
+      }
+
+      // Skip capture for subagents — their ephemeral UUIDs create orphaned
+      // namespaces that are never read again.
+      if (isSubagentSession(sessionId)) {
+        api.logger.info("openclaw-mem0: skipping capture for subagent (main agent captures consolidated result)");
+        return;
+      }
+
+      // Update shared state for tools
+      if (sessionId) session.setCurrentSessionId(sessionId);
+
+      try {
+        // Patterns indicating an assistant message contains a summary of
+        // completed work — high-value for extraction
+        const SUMMARY_PATTERNS = [
+          /## What I (Accomplished|Built|Updated)/i,
+          /✅\s*(Done|Complete|All done)/i,
+          /Here's (what I updated|the recap|a summary)/i,
+          /### Changes Made/i,
+          /Implementation Status/i,
+          /All locked in\. Quick summary/i,
+        ];
+
+        // First pass: extract all messages into a typed array
+        const allParsed: Array<{
+          role: string;
+          content: string;
+          index: number;
+          isSummary: boolean;
+        }> = [];
+
+        for (let i = 0; i < event.messages.length; i++) {
+          const msg = event.messages[i];
+          if (!msg || typeof msg !== "object") continue;
+          const msgObj = msg as Record<string, unknown>;
+
+          const role = msgObj.role;
+          if (role !== "user" && role !== "assistant") continue;
+
+          let textContent = "";
+          const content = msgObj.content;
+
+          if (typeof content === "string") {
+            textContent = content;
+          } else if (Array.isArray(content)) {
+            for (const block of content) {
+              if (
+                block &&
+                typeof block === "object" &&
+                "text" in block &&
+                typeof (block as Record<string, unknown>).text === "string"
+              ) {
+                textContent +=
+                  (textContent ? "\n" : "") +
+                  ((block as Record<string, unknown>).text as string);
+              }
+            }
+          }
+
+          if (!textContent) continue;
+          // Strip injected memory context, keep the actual user text
+          if (textContent.includes("<relevant-memories>")) {
+            textContent = textContent.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g, "").trim();
+            if (!textContent) continue;
+          }
+
+          const isSummary =
+            role === "assistant" &&
+            SUMMARY_PATTERNS.some((p) => p.test(textContent));
+
+          allParsed.push({
+            role: role as string,
+            content: textContent,
+            index: i,
+            isSummary,
+          });
+        }
+
+        if (allParsed.length === 0) return;
+
+        // Select messages: last 20 + any earlier summary messages,
+        // sorted by original index to preserve chronological order.
+        const recentWindow = 20;
+        const recentCutoff = allParsed.length - recentWindow;
+
+        const candidates: typeof allParsed = [];
+
+        // Include summary messages from anywhere in the conversation
+        for (const msg of allParsed) {
+          if (msg.isSummary && msg.index < recentCutoff) {
+            candidates.push(msg);
+          }
+        }
+
+        // Include recent messages
+        const seenIndices = new Set(candidates.map((m) => m.index));
+        for (const msg of allParsed) {
+          if (msg.index >= recentCutoff && !seenIndices.has(msg.index)) {
+            candidates.push(msg);
+          }
+        }
+
+        // Sort by original position
+        candidates.sort((a, b) => a.index - b.index);
+
+        const selected = candidates.map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+
+        // Apply noise filtering pipeline: drop noise, strip fragments, truncate
+        let formattedMessages = filterMessagesForExtraction(selected);
+
+        // LCM capture filter: restrict to user-role messages to prevent
+        // re-extraction of compacted summaries (Vigil Track B, Blocker 1)
+        formattedMessages = filterCaptureMessages(formattedMessages);
+
+        if (formattedMessages.length === 0) return;
+
+        // Skip if no meaningful user content remains after filtering
+        if (!formattedMessages.some((m) => m.role === "user")) return;
+
+        // Inject a timestamp preamble
+        const timestamp = new Date().toISOString().split("T")[0];
+        formattedMessages.unshift({
+          role: "system",
+          content: `Current date: ${timestamp}. The user is identified as "${cfg.userId}". Extract durable facts from this conversation. Include this date when storing time-sensitive information.`,
+        });
+
+        if (cfg.agentMemory) {
+          // Multi-pool capture
+          const agentId = (ctx as any)?.agentId ?? session.getCurrentAgentId();
+          const safeSessionId = (ctx as any)?.sessionKey ?? sessionId;
+          const capturePool = pool.getCapturePool(agentId);
           // B8 FIX: Skip capture if agent identity unknown (fail-closed)
           if (!capturePool) {
             api.logger.warn("openclaw-mem0: skipping capture -- agent identity unknown, fail-closed");
             return;
           }
-          const sessionInfo = extractSessionInfo(safeSessionId);
+          const sessionInfo = pool.extractSessionInfo(safeSessionId);
           const provenance: Record<string, unknown> = {
             is_private: sessionInfo.conversationType !== "group",
             source_channel: sessionInfo.channel ?? "unknown",
@@ -1737,11 +1530,8 @@ const memoryPlugin = {
             chat_id: sessionInfo.chatId,
             agent_id: agentId ?? "main",
           };
-          const addOpts = buildAddOptions(capturePool, safeSessionId, provenance);
-          const result = await provider.add(
-            captureMessages,
-            addOpts,
-          );
+          const addOpts = buildAddOptions(capturePool, safeSessionId, safeSessionId, provenance);
+          const result = await provider.add(formattedMessages, addOpts);
 
           const capturedCount = result.results?.length ?? 0;
           if (capturedCount > 0) {
@@ -1749,28 +1539,23 @@ const memoryPlugin = {
               `openclaw-mem0: auto-captured ${capturedCount} memories (pool: ${capturePool})`,
             );
           }
-        } catch (err) {
-          api.logger.warn(`openclaw-mem0: capture failed: ${String(err)}`);
+        } else {
+          // Standard capture
+          const addOpts = buildAddOptions(undefined, sessionId, sessionId);
+          const result = await provider.add(formattedMessages, addOpts);
+
+          const capturedCount = result.results?.length ?? 0;
+          if (capturedCount > 0) {
+            api.logger.info(
+              `openclaw-mem0: auto-captured ${capturedCount} memories`,
+            );
+          }
         }
-      });
-    }
-
-    // ========================================================================
-    // Service
-    // ========================================================================
-
-    api.registerService({
-      id: "openclaw-mem0",
-      start: () => {
-        api.logger.info(
-          `openclaw-mem0: initialized (mode: ${cfg.mode}, user: ${cfg.userId}, autoRecall: ${cfg.autoRecall}, autoCapture: ${cfg.autoCapture})`,
-        );
-      },
-      stop: () => {
-        api.logger.info("openclaw-mem0: stopped");
-      },
+      } catch (err) {
+        api.logger.warn(`openclaw-mem0: capture failed: ${String(err)}`);
+      }
     });
-  },
-};
+  }
+}
 
 export default memoryPlugin;
