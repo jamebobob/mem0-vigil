@@ -113,7 +113,7 @@ export class Memory {
       }
     }
 
-    this.vectorStore = VectorStoreFactory.create(
+    this.vectorStore = await VectorStoreFactory.create(
       this.config.vectorStore.provider,
       this.config.vectorStore.config,
     );

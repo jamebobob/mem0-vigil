@@ -17,11 +17,8 @@ import { Embedder } from "../embeddings/base";
 import { LLM } from "../llms/base";
 import { VectorStore } from "../vector_stores/base";
 import { Qdrant } from "../vector_stores/qdrant";
-import { VectorizeDB } from "../vector_stores/vectorize";
-import { RedisDB } from "../vector_stores/redis";
 import { OllamaLLM } from "../llms/ollama";
 import { LMStudioLLM } from "../llms/lmstudio";
-import { SupabaseDB } from "../vector_stores/supabase";
 import { SQLiteManager } from "../storage/SQLiteManager";
 import { MemoryHistoryManager } from "../storage/MemoryHistoryManager";
 import { SupabaseHistoryManager } from "../storage/SupabaseHistoryManager";
@@ -32,9 +29,6 @@ import { AzureOpenAILLM } from "../llms/azure";
 import { AzureOpenAIEmbedder } from "../embeddings/azure";
 import { LangchainLLM } from "../llms/langchain";
 import { LangchainEmbedder } from "../embeddings/langchain";
-import { LangchainVectorStore } from "../vector_stores/langchain";
-import { AzureAISearch } from "../vector_stores/azure_ai_search";
-import { PGVector } from "../vector_stores/pgvector";
 
 export class EmbedderFactory {
   static create(provider: string, config: EmbeddingConfig): Embedder {
@@ -89,24 +83,41 @@ export class LLMFactory {
 }
 
 export class VectorStoreFactory {
-  static create(provider: string, config: VectorStoreConfig): VectorStore {
+  static async create(
+    provider: string,
+    config: VectorStoreConfig,
+  ): Promise<VectorStore> {
     switch (provider.toLowerCase()) {
       case "memory":
         return new MemoryVectorStore(config);
       case "qdrant":
         return new Qdrant(config as any);
-      case "redis":
+      case "redis": {
+        const { RedisDB } = await import("../vector_stores/redis");
         return new RedisDB(config as any);
-      case "supabase":
+      }
+      case "supabase": {
+        const { SupabaseDB } = await import("../vector_stores/supabase");
         return new SupabaseDB(config as any);
-      case "langchain":
+      }
+      case "langchain": {
+        const { LangchainVectorStore } =
+          await import("../vector_stores/langchain");
         return new LangchainVectorStore(config as any);
-      case "vectorize":
+      }
+      case "vectorize": {
+        const { VectorizeDB } = await import("../vector_stores/vectorize");
         return new VectorizeDB(config as any);
-      case "azure-ai-search":
+      }
+      case "azure-ai-search": {
+        const { AzureAISearch } =
+          await import("../vector_stores/azure_ai_search");
         return new AzureAISearch(config as any);
-      case "pgvector":
+      }
+      case "pgvector": {
+        const { PGVector } = await import("../vector_stores/pgvector");
         return new PGVector(config as any);
+      }
       default:
         throw new Error(`Unsupported vector store provider: ${provider}`);
     }
